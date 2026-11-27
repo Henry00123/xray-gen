@@ -30,6 +30,16 @@ wget -qO xray_gen.sh https://raw.githubusercontent.com/Henry00123/xray-gen/main/
 # 将第 2 条出站切换为默认主出站
 ./xray_gen.sh --out-index 2
 
+# 安装 / 更新 Xray（官方 install-release.sh）
+./xray_gen.sh --install-xray
+./xray_gen.sh --install-xray --xray-user root
+
+# 查看 Xray 运行状态、监听端口与最近日志
+./xray_gen.sh --status
+
+# 启停 / 重启 Xray 服务
+./xray_gen.sh --restart
+
 # 检查并更新脚本到最新版本
 ./xray_gen.sh -u
 

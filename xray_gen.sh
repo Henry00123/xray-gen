@@ -6,6 +6,7 @@
 # 3. 支持入站：SOCKS5、HTTP、SOCKS5+HTTP、VLESS、Shadowsocks、Dokodemo-door
 # 4. 支持出站：直连 (freedom)、手动配置协议、从分享链接解析 (vless/vmess/trojan/ss/socks5/http)
 # 5. 支持脚本自更新 (-u/--update 或交互式菜单)，支持自定义更新地址与镜像源
+# 6. 支持通过官方 install-release.sh 安装/更新/卸载 Xray，以及 Xray 状态监测与服务启停管理
 
 set -euo pipefail
 
@@ -383,7 +384,11 @@ show_outbounds_summary() {
 
 show_config_summary() {
   local file="$1"
-  ui_header "Xray 配置摘要" "$file"
+  echo "" >&2
+  ui_hr
+  printf '  %s%s◆ Xray 配置摘要%s  %s%s%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$file" "$C_RESET" >&2
+  printf '  %s● Xray 状态:%s %s\n' "$C_DIM" "$C_RESET" "$(get_xray_brief_status)" >&2
+  ui_hr
   show_inbounds_summary "$INBOUNDS_JSON"
   echo "" >&2
   show_outbounds_summary "$OUTBOUNDS_JSON"
@@ -1987,6 +1992,328 @@ self_update() {
   echo "脚本已更新：${target_path}"
 }
 
+# ==================== Xray 安装与状态监测 ====================
+
+XRAY_INSTALL_URL="${XRAY_INSTALL_URL:-https://github.com/XTLS/Xray-install/raw/main/install-release.sh}"
+
+run_privileged() {
+  if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "错误：该操作需要 root 权限，请切换为 root 或安装 sudo 后重试。" >&2
+    return 1
+  fi
+}
+
+download_xray_installer() {
+  local url="$1"
+  local dest="$2"
+  if [[ "$url" == file://* ]]; then
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL -o "$dest" "$url"
+      return $?
+    fi
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q --no-cache --timeout=30 -O "$dest" "$url"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL -H "Cache-Control: no-cache" --connect-timeout 15 --max-time 120 -o "$dest" "$url"
+  else
+    echo "错误：未找到 wget 或 curl，无法下载 Xray 安装脚本。" >&2
+    return 1
+  fi
+}
+
+get_xray_version() {
+  if ! command -v xray >/dev/null 2>&1; then
+    return 1
+  fi
+  local raw first_line ver
+  raw="$(xray version 2>/dev/null || true)"
+  first_line="${raw%%$'\n'*}"
+  ver="$(printf '%s' "$first_line" | awk '{print $2}')"
+  printf '%s' "${ver:-unknown}"
+}
+
+get_xray_brief_status() {
+  local ver=""
+  if ! ver="$(get_xray_version)"; then
+    printf '%s未安装%s' "$C_YELLOW" "$C_RESET"
+    return 0
+  fi
+
+  local state_text=""
+  if command -v systemctl >/dev/null 2>&1; then
+    local active=""
+    active="$(systemctl is-active xray 2>/dev/null || true)"
+    case "$active" in
+      active)
+        state_text="${C_GREEN}运行中${C_RESET}"
+        ;;
+      activating|reloading)
+        state_text="${C_YELLOW}启动中 (${active})${C_RESET}"
+        ;;
+      failed)
+        state_text="${C_RED}异常退出 (failed)${C_RESET}"
+        ;;
+      inactive)
+        state_text="${C_YELLOW}未运行 (inactive)${C_RESET}"
+        ;;
+      *)
+        if command -v pgrep >/dev/null 2>&1 && pgrep -x xray >/dev/null 2>&1; then
+          state_text="${C_GREEN}运行中 (进程)${C_RESET}"
+        else
+          state_text="${C_DIM}未运行 (${active:-未注册服务})${C_RESET}"
+        fi
+        ;;
+    esac
+  elif command -v pgrep >/dev/null 2>&1 && pgrep -x xray >/dev/null 2>&1; then
+    state_text="${C_GREEN}运行中${C_RESET}"
+  else
+    state_text="${C_DIM}未运行${C_RESET}"
+  fi
+
+  printf '%s%s%s %s·%s %s' "$C_BOLD" "$ver" "$C_RESET" "$C_DIM" "$C_RESET" "$state_text"
+}
+
+install_xray() {
+  local action="${1:-install}"
+  shift || true
+
+  local tmp_script
+  tmp_script="$(mktemp)"
+  echo "正在下载 Xray 官方安装脚本: ${XRAY_INSTALL_URL}"
+  if ! download_xray_installer "$XRAY_INSTALL_URL" "$tmp_script"; then
+    rm -f "$tmp_script"
+    echo "错误：下载 Xray 安装脚本失败，请检查网络连接（也可通过环境变量 XRAY_INSTALL_URL 指定镜像地址）。" >&2
+    return 1
+  fi
+
+  if [[ ! -s "$tmp_script" ]] || ! bash -n "$tmp_script"; then
+    rm -f "$tmp_script"
+    echo "错误：下载的安装脚本为空或未通过 bash -n 语法校验，已取消执行。" >&2
+    return 1
+  fi
+
+  echo "正在执行 Xray 官方脚本: ${action}${*:+ $*}"
+  local rc=0
+  run_privileged bash "$tmp_script" "$action" "$@" || rc=$?
+  rm -f "$tmp_script"
+
+  if (( rc != 0 )); then
+    echo "错误：Xray 官方脚本执行失败（退出码: ${rc}）。" >&2
+    return "$rc"
+  fi
+
+  if [[ "$action" == "install" ]]; then
+    local ver=""
+    if ver="$(get_xray_version)"; then
+      echo "Xray 安装/更新完成，当前版本：${ver}"
+    else
+      echo "Xray 安装脚本执行完成。"
+    fi
+  else
+    echo "Xray 操作 (${action}) 执行完成。"
+  fi
+}
+
+manage_xray_install_interactive() {
+  echo "" >&2
+  ui_header "Xray 安装与卸载" "$(get_xray_brief_status)"
+  ui_section "选择操作"
+  ui_item "1" "安装 / 更新 Xray" "使用官方默认配置 (install)" "$C_GREEN"
+  ui_item "2" "安装 / 更新 Xray (root 运行)" "以 root 用户运行服务 (install -u root)" "$C_CYAN"
+  ui_item "3" "卸载 Xray" "执行官方卸载命令 (remove)" "$C_RED"
+  ui_item "0" "返回" "" "$C_DIM"
+  echo "" >&2
+
+  local op
+  op="$(ask "请选择 (0-3)" "1")"
+  case "$op" in
+    1)
+      install_xray install
+      ;;
+    2)
+      install_xray install -u root
+      ;;
+    3)
+      if ask_yes_no "确认卸载 Xray" "n"; then
+        install_xray remove
+      else
+        echo "已取消卸载。" >&2
+      fi
+      ;;
+    0)
+      return 0
+      ;;
+    *)
+      echo "无效选项。" >&2
+      return 1
+      ;;
+  esac
+}
+
+control_xray_service() {
+  local action="$1"
+  case "$action" in
+    start|stop|restart) ;;
+    *)
+      echo "错误：不支持的服务操作: ${action}（仅支持 start / stop / restart）。" >&2
+      return 1
+      ;;
+  esac
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "错误：当前系统未检测到 systemctl，无法通过 systemd 控制 Xray 服务。" >&2
+    return 1
+  fi
+
+  echo "正在执行: systemctl ${action} xray ..."
+  local rc=0
+  run_privileged systemctl "$action" xray || rc=$?
+
+  local state=""
+  state="$(systemctl is-active xray 2>/dev/null || true)"
+  if (( rc == 0 )); then
+    echo "执行完成，当前服务状态：${state:-unknown}"
+  else
+    echo "错误：systemctl ${action} xray 执行失败（当前状态：${state:-unknown}）。" >&2
+    if command -v journalctl >/dev/null 2>&1; then
+      echo "--- 最近日志 (journalctl -u xray -n 10) ---" >&2
+      local err_logs=""
+      err_logs="$(journalctl -u xray -n 10 --no-pager 2>/dev/null || true)"
+      [[ -n "$err_logs" ]] && printf '%s\n' "$err_logs" >&2
+    fi
+    return "$rc"
+  fi
+}
+
+show_xray_status() {
+  local cfg_path="${1:-./config.json}"
+  ui_header "Xray 状态监测"
+
+  ui_section "安装信息"
+  if command -v xray >/dev/null 2>&1; then
+    local xray_bin raw_ver first_line
+    xray_bin="$(command -v xray)"
+    raw_ver="$(xray version 2>/dev/null || true)"
+    first_line="${raw_ver%%$'\n'*}"
+    printf '  %s路径:%s %s\n' "$C_DIM" "$C_RESET" "$xray_bin" >&2
+    printf '  %s版本:%s %s%s%s\n' "$C_DIM" "$C_RESET" "$C_BOLD" "${first_line:-unknown}" "$C_RESET" >&2
+  else
+    printf '  %s未检测到 xray 可执行文件（可运行 ./xray_gen.sh --install-xray 安装）%s\n' "$C_YELLOW" "$C_RESET" >&2
+  fi
+
+  echo "" >&2
+  ui_section "服务运行状态"
+  if command -v systemctl >/dev/null 2>&1; then
+    local active enabled main_pid svc_user started_at active_color="$C_YELLOW"
+    active="$(systemctl is-active xray 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled xray 2>/dev/null || true)"
+    main_pid="$(systemctl show xray -p MainPID --value 2>/dev/null || true)"
+    svc_user="$(systemctl show xray -p User --value 2>/dev/null || true)"
+    started_at="$(systemctl show xray -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+    [[ "$active" == "active" ]] && active_color="$C_GREEN"
+    [[ "$active" == "failed" ]] && active_color="$C_RED"
+    printf '  %s运行状态:%s %s%s%s%s\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$active_color" "${active:-unknown}" "$C_RESET" >&2
+    printf '  %s开机自启:%s %s\n' "$C_DIM" "$C_RESET" "${enabled:-未注册}" >&2
+    [[ -n "$main_pid" && "$main_pid" != "0" ]] && printf '  %s主进程PID:%s %s\n' "$C_DIM" "$C_RESET" "$main_pid" >&2
+    [[ -n "$svc_user" ]] && printf '  %s运行用户:%s %s\n' "$C_DIM" "$C_RESET" "$svc_user" >&2
+    [[ -n "$started_at" ]] && printf '  %s启动时间:%s %s\n' "$C_DIM" "$C_RESET" "$started_at" >&2
+  elif command -v pgrep >/dev/null 2>&1; then
+    local pids=""
+    pids="$(pgrep -x xray 2>/dev/null | tr '\n' ' ' || true)"
+    if [[ -n "$pids" ]]; then
+      printf '  %s运行状态:%s %s运行中%s (PID: %s)\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET" "${pids% }" >&2
+    else
+      printf '  %s运行状态:%s %s未运行%s (当前环境无 systemctl)\n' "$C_DIM" "$C_RESET" "$C_YELLOW" "$C_RESET" >&2
+    fi
+  else
+    printf '  %s当前环境无 systemctl / pgrep，无法检测服务进程%s\n' "$C_DIM" "$C_RESET" >&2
+  fi
+
+  echo "" >&2
+  ui_section "配置文件检查"
+  local check_cfg="$cfg_path"
+  if [[ ! -f "$check_cfg" && -f "/usr/local/etc/xray/config.json" ]]; then
+    check_cfg="/usr/local/etc/xray/config.json"
+  fi
+  if [[ -f "$check_cfg" ]]; then
+    local mode="" owner=""
+    mode="$(stat -c '%a' "$check_cfg" 2>/dev/null || stat -f '%Lp' "$check_cfg" 2>/dev/null || true)"
+    owner="$(stat -c '%U:%G' "$check_cfg" 2>/dev/null || stat -f '%Su:%Sg' "$check_cfg" 2>/dev/null || true)"
+    printf '  %s文件:%s %s %s(权限: %s, 属主: %s)%s\n' "$C_DIM" "$C_RESET" "$check_cfg" "$C_DIM" "${mode:--}" "${owner:--}" "$C_RESET" >&2
+    if command -v xray >/dev/null 2>&1; then
+      if xray run -test -format json -c "$check_cfg" >/dev/null 2>&1; then
+        printf '  %s校验:%s %s通过 (xray run -test)%s\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET" >&2
+      else
+        printf '  %s校验:%s %s未通过（请运行 xray run -test -c %s 查看详情）%s\n' "$C_DIM" "$C_RESET" "$C_RED" "$check_cfg" "$C_RESET" >&2
+      fi
+    fi
+  else
+    printf '  %s未找到配置文件 (%s)%s\n' "$C_DIM" "$cfg_path" "$C_RESET" >&2
+  fi
+
+  echo "" >&2
+  ui_section "监听端口"
+  local ports=""
+  if command -v ss >/dev/null 2>&1; then
+    ports="$(ss -tulnp 2>/dev/null | grep -i 'xray' || true)"
+  elif command -v netstat >/dev/null 2>&1; then
+    ports="$(netstat -tulnp 2>/dev/null | grep -i 'xray' || true)"
+  fi
+  if [[ -n "$ports" ]]; then
+    printf '%s\n' "$ports" | sed 's/^/  /' >&2
+  else
+    printf '  %s未检测到 xray 监听端口（非 root 用户可能需要 sudo 才能显示进程名）%s\n' "$C_DIM" "$C_RESET" >&2
+  fi
+
+  echo "" >&2
+  ui_section "最近日志" "(最多 15 条)"
+  local logs=""
+  if command -v journalctl >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+    logs="$(journalctl -u xray -n 15 --no-pager 2>/dev/null || true)"
+  elif [[ -r /var/log/xray/error.log ]]; then
+    logs="$(tail -n 15 /var/log/xray/error.log 2>/dev/null || true)"
+  fi
+  if [[ -n "$logs" ]]; then
+    printf '%s\n' "$logs" | sed 's/^/  /' >&2
+  else
+    printf '  %s暂无可用日志（非 root 用户可能需要 sudo 查看 journalctl）%s\n' "$C_DIM" "$C_RESET" >&2
+  fi
+  ui_hr
+}
+
+monitor_xray_interactive() {
+  local cfg_path="${1:-./config.json}"
+  while true; do
+    show_xray_status "$cfg_path"
+    echo "" >&2
+    ui_section "Xray 服务操作"
+    ui_item "1" "刷新状态"
+    ui_item "2" "启动 Xray" "systemctl start xray" "$C_GREEN"
+    ui_item "3" "重启 Xray" "systemctl restart xray" "$C_YELLOW"
+    ui_item "4" "停止 Xray" "systemctl stop xray" "$C_RED"
+    ui_item "5" "安装 / 更新 / 卸载 Xray" "执行官方 install-release.sh"
+    ui_item "0" "退出" "" "$C_DIM"
+    echo "" >&2
+
+    local op
+    op="$(ask "请选择 (0-5)" "0")"
+    case "$op" in
+      1) continue ;;
+      2) control_xray_service start || true ;;
+      3) control_xray_service restart || true ;;
+      4) control_xray_service stop || true ;;
+      5) manage_xray_install_interactive || true ;;
+      0) return 0 ;;
+      *) echo "无效选项。" >&2 ;;
+    esac
+  done
+}
+
 # ==================== 主流程与命令行参数 ====================
 
 usage() {
@@ -1994,8 +2321,8 @@ usage() {
 用法: ./xray_gen.sh [选项]
 
 无参数运行时自动检查当前目录 ./config.json：
-  - 若存在：展示当前入站/出站与 TLS 路径，可选择只修改入站、只修改出站或只设置 TLS 证书路径
-  - 若不存在：引导生成全新的 config.json
+  - 若存在：展示 Xray 状态概览及当前入站/出站摘要，进入主菜单
+  - 若不存在：展示 Xray 状态概览及简明主菜单（可新建配置、安装 Xray 或监测状态）
 
 选项:
   -c, -o, --output <file>   指定配置文件路径 (默认: ./config.json)
@@ -2010,6 +2337,13 @@ usage() {
       --direct              快捷模式将主出站切换为直连（已有 direct 出站时优先置顶，避免重复 tag）
       --link <uri>          快捷模式从分享链接解析主出站（单独传入时仅修改出站）
       --fresh               忽略现有 config.json，强制生成全新配置
+      --install-xray        下载并执行官方 install-release.sh 安装/更新 Xray 后退出
+      --xray-user <user>    配合 --install-xray 指定服务运行用户 (如 root，对应官方 -u 参数)
+      --uninstall-xray      通过官方 install-release.sh 卸载 Xray 后退出
+      --status              监测并展示 Xray 版本、服务状态、监听端口与最近日志后退出
+      --start               启动 xray.service 服务后退出
+      --stop                停止 xray.service 服务后退出
+      --restart             重启 xray.service 服务后退出
   -u, --update              检查并更新当前脚本到最新版本后退出
       --update-url <url>    指定更新脚本的下载地址 (也可通过环境变量 XRAY_GEN_UPDATE_URL 指定)
   -h, --help                显示帮助信息
@@ -2029,6 +2363,11 @@ main() {
   local fresh_mode="false"
   local do_update="false"
   local update_url=""
+  local do_install_xray="false"
+  local do_uninstall_xray="false"
+  local xray_user=""
+  local do_status="false"
+  local service_action=""
   local in_proto=""
   local listen="127.0.0.1"
   local port="10808"
@@ -2046,21 +2385,28 @@ main() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -c|-o|--output) require_arg "$1" "${2:-}"; config_file="$2"; shift 2 ;;
-      -s|--show)      show_only="true"; shift ;;
-      --fresh)        fresh_mode="true"; shift ;;
-      -u|--update)    do_update="true"; shift ;;
-      --update-url)   require_arg "$1" "${2:-}"; update_url="$2"; shift 2 ;;
-      --in-proto)     require_arg "$1" "${2:-}"; in_proto="$2"; has_in_proto="true"; shift 2 ;;
-      --listen)       require_arg "$1" "${2:-}"; listen="$2"; has_listen_arg="true"; shift 2 ;;
-      --port)         require_arg "$1" "${2:-}"; port="$2"; has_port_arg="true"; shift 2 ;;
-      --tls-cert)     require_arg "$1" "${2:-}"; tls_cert="$2"; has_tls_args="true"; shift 2 ;;
-      --tls-key)      require_arg "$1" "${2:-}"; tls_key="$2"; has_tls_args="true"; shift 2 ;;
-      --in-index)     require_arg "$1" "${2:-}"; in_index="$2"; shift 2 ;;
-      --out-index)    require_arg "$1" "${2:-}"; out_index="$2"; shift 2 ;;
-      --direct)       use_direct="true"; has_out_args="true"; shift ;;
-      --link)         require_arg "$1" "${2:-}"; link="$2"; has_out_args="true"; shift 2 ;;
-      -h|--help)      usage; exit 0 ;;
+      -c|-o|--output)  require_arg "$1" "${2:-}"; config_file="$2"; shift 2 ;;
+      -s|--show)       show_only="true"; shift ;;
+      --fresh)         fresh_mode="true"; shift ;;
+      -u|--update)     do_update="true"; shift ;;
+      --update-url)    require_arg "$1" "${2:-}"; update_url="$2"; shift 2 ;;
+      --install-xray)  do_install_xray="true"; shift ;;
+      --xray-user)     require_arg "$1" "${2:-}"; xray_user="$2"; shift 2 ;;
+      --uninstall-xray) do_uninstall_xray="true"; shift ;;
+      --status)        do_status="true"; shift ;;
+      --start)         service_action="start"; shift ;;
+      --stop)          service_action="stop"; shift ;;
+      --restart)       service_action="restart"; shift ;;
+      --in-proto)      require_arg "$1" "${2:-}"; in_proto="$2"; has_in_proto="true"; shift 2 ;;
+      --listen)        require_arg "$1" "${2:-}"; listen="$2"; has_listen_arg="true"; shift 2 ;;
+      --port)          require_arg "$1" "${2:-}"; port="$2"; has_port_arg="true"; shift 2 ;;
+      --tls-cert)      require_arg "$1" "${2:-}"; tls_cert="$2"; has_tls_args="true"; shift 2 ;;
+      --tls-key)       require_arg "$1" "${2:-}"; tls_key="$2"; has_tls_args="true"; shift 2 ;;
+      --in-index)      require_arg "$1" "${2:-}"; in_index="$2"; shift 2 ;;
+      --out-index)     require_arg "$1" "${2:-}"; out_index="$2"; shift 2 ;;
+      --direct)        use_direct="true"; has_out_args="true"; shift ;;
+      --link)          require_arg "$1" "${2:-}"; link="$2"; has_out_args="true"; shift 2 ;;
+      -h|--help)       usage; exit 0 ;;
       *)
         echo "未知参数: $1" >&2
         usage >&2
@@ -2074,7 +2420,38 @@ main() {
     exit 0
   fi
 
-  check_deps
+  if [[ "$do_install_xray" == "true" ]]; then
+    if [[ -n "$xray_user" ]]; then
+      install_xray install -u "$xray_user"
+    else
+      install_xray install
+    fi
+    exit 0
+  fi
+
+  if [[ "$do_uninstall_xray" == "true" ]]; then
+    install_xray remove
+    exit 0
+  fi
+
+  if [[ -n "$service_action" ]]; then
+    control_xray_service "$service_action"
+    exit 0
+  fi
+
+  if [[ "$do_status" == "true" ]]; then
+    show_xray_status "$config_file"
+    exit 0
+  fi
+
+  local is_quick_mode="false"
+  if [[ "$has_in_proto" == "true" || "$has_listen_arg" == "true" || "$has_port_arg" == "true" || "$has_tls_args" == "true" || "$has_out_args" == "true" || -n "$out_index" ]]; then
+    is_quick_mode="true"
+  fi
+
+  if [[ "$show_only" == "true" || "$is_quick_mode" == "true" || ( "$fresh_mode" == "false" && -f "$config_file" ) ]]; then
+    check_deps
+  fi
 
   if [[ "$has_port_arg" == "true" ]] && ! is_valid_port "$port"; then
     echo "错误：--port 端口号无效: ${port}（有效范围 1-65535，不含前导零）。" >&2
@@ -2082,7 +2459,7 @@ main() {
   fi
 
   local has_existing="false"
-  if [[ "$fresh_mode" == "false" ]]; then
+  if [[ "$fresh_mode" == "false" && -f "$config_file" ]]; then
     local load_rc=0
     load_existing_config "$config_file" || load_rc=$?
     if (( load_rc == 0 )); then
@@ -2105,7 +2482,7 @@ main() {
   fi
 
   # 命令行快捷模式（支持只改入站、只改监听/端口、只改 TLS 路径或只改出站）
-  if [[ "$has_in_proto" == "true" || "$has_listen_arg" == "true" || "$has_port_arg" == "true" || "$has_tls_args" == "true" || "$has_out_args" == "true" || -n "$out_index" ]]; then
+  if [[ "$is_quick_mode" == "true" ]]; then
     if [[ -n "$out_index" && "$has_out_args" == "true" ]]; then
       echo "错误：--out-index 不能与 --direct 或 --link 同时使用。" >&2
       exit 1
@@ -2204,12 +2581,14 @@ main() {
     ui_item "4" "同时修改入站和出站" "保留 log / routing / dns 等其他字段"
     ui_item "5" "全新生成配置" "忽略原文件内容，重新引导生成" "$C_YELLOW"
     ui_hr
-    ui_item "6" "更新脚本" "检查并更新 xray_gen.sh 到最新版本" "$C_GREEN"
-    ui_item "7" "退出" "不修改配置直接退出" "$C_DIM"
+    ui_item "6" "Xray 状态监测与服务管理" "查看版本 / 状态 / 端口 / 日志 / 启停重启" "$C_CYAN"
+    ui_item "7" "安装 / 更新 / 卸载 Xray" "执行官方 install-release.sh" "$C_GREEN"
+    ui_item "8" "更新本脚本" "检查并更新 xray_gen.sh 到最新版本" "$C_GREEN"
+    ui_item "0" "退出" "不修改配置直接退出" "$C_DIM"
     echo "" >&2
 
     local action
-    action="$(ask "请选择 (1-7)" "3")"
+    action="$(ask "请选择 (0-8)" "3")"
     case "$action" in
       1)
         edit_existing_inbounds_interactive
@@ -2230,12 +2609,20 @@ main() {
         configure_full_outbounds_interactive
         ;;
       6)
+        monitor_xray_interactive "$config_file"
+        exit 0
+        ;;
+      7)
+        manage_xray_install_interactive
+        exit 0
+        ;;
+      8)
         local target_url="${update_url:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
         target_url="$(ask "更新脚本 URL (回车使用默认地址)" "$target_url")"
         self_update "$target_url"
         exit 0
         ;;
-      7)
+      0)
         echo "已退出，未修改配置。"
         exit 0
         ;;
@@ -2250,10 +2637,52 @@ main() {
     fi
     config_file="$(ask "保存配置文件路径" "$config_file")"
   else
-    echo "未在当前目录检测到有效的 ${config_file}，将为您生成新配置。" >&2
-    INBOUNDS_JSON="$(build_inbounds_interactive)"
-    configure_full_outbounds_interactive
-    config_file="$(ask "输出文件路径" "$config_file")"
+    echo "" >&2
+    ui_hr
+    printf '  %s%s◆ Xray 配置与管理工具%s  %s(未检测到 %s)%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$config_file" "$C_RESET" >&2
+    printf '  %s● Xray 状态:%s %s\n' "$C_DIM" "$C_RESET" "$(get_xray_brief_status)" >&2
+    ui_hr
+    echo "" >&2
+    ui_section "主菜单" "请选择要执行的操作"
+    ui_item "1" "生成新配置" "引导创建 ${config_file}" "$C_GREEN"
+    ui_item "2" "Xray 状态监测与服务管理" "查看版本 / 状态 / 端口 / 日志 / 启停重启" "$C_CYAN"
+    ui_item "3" "安装 / 更新 / 卸载 Xray" "执行官方 install-release.sh" "$C_GREEN"
+    ui_item "4" "更新本脚本" "检查并更新 xray_gen.sh 到最新版本" "$C_GREEN"
+    ui_item "0" "退出" "" "$C_DIM"
+    echo "" >&2
+
+    local action
+    action="$(ask "请选择 (0-4)" "1")"
+    case "$action" in
+      1)
+        check_deps
+        INBOUNDS_JSON="$(build_inbounds_interactive)"
+        configure_full_outbounds_interactive
+        config_file="$(ask "输出文件路径" "$config_file")"
+        ;;
+      2)
+        monitor_xray_interactive "$config_file"
+        exit 0
+        ;;
+      3)
+        manage_xray_install_interactive
+        exit 0
+        ;;
+      4)
+        local target_url="${update_url:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
+        target_url="$(ask "更新脚本 URL (回车使用默认地址)" "$target_url")"
+        self_update "$target_url"
+        exit 0
+        ;;
+      0)
+        echo "已退出。"
+        exit 0
+        ;;
+      *)
+        echo "无效选项。" >&2
+        exit 1
+        ;;
+    esac
   fi
 
   save_config "$config_file" "true"
