@@ -1824,7 +1824,7 @@ save_config() {
 
   local output_dir tmp_file
   output_dir="$(dirname "$output")"
-  tmp_file="$(mktemp "${output_dir}/.xray_config.tmp.XXXXXX")"
+  tmp_file="$(mktemp "${output_dir}/.xray_config.tmp.XXXXXX.json" 2>/dev/null || mktemp "${output_dir}/.xray_config.tmp.XXXXXX")"
   if ! printf '%s\n' "$final_json" > "$tmp_file"; then
     rm -f "$tmp_file"
     return 1
@@ -1869,7 +1869,7 @@ validate_with_xray() {
   if command -v xray >/dev/null 2>&1; then
     echo ""
     echo "检测到本地 xray，正在执行写入前配置校验..."
-    if xray run -test -c "$cfg"; then
+    if xray run -test -format json -c "$cfg"; then
       echo "校验通过。"
       return 0
     fi
