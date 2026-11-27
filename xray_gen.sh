@@ -52,17 +52,36 @@ ask() {
   fi
 }
 
+ask_required() {
+  local prompt="$1"
+  local default="${2:-}"
+  local val
+  while true; do
+    val="$(ask "$prompt" "$default")"
+    if [[ -n "$val" ]]; then
+      printf '%s' "$val"
+      return 0
+    fi
+    echo "该项不能为空，请重新输入。" >&2
+  done
+}
+
+is_valid_port() {
+  local p="${1:-}"
+  [[ "$p" =~ ^[1-9][0-9]*$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
 ask_port() {
   local prompt="$1"
   local default="$2"
   local val
   while true; do
     val="$(ask "$prompt" "$default")"
-    if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= 65535 )); then
+    if is_valid_port "$val"; then
       printf '%s' "$val"
       return 0
     fi
-    echo "请输入 1-65535 之间的有效端口号。" >&2
+    echo "请输入 1-65535 之间的有效端口号（不含前导零）。" >&2
   done
 }
 
@@ -140,18 +159,29 @@ split_host_port() {
   local default_port="$2"
   HP_HOST=""
   HP_PORT="$default_port"
-  if [[ "$hp" =~ ^\[([^\]]+)\]:([0-9]+)$ ]]; then
+  if [[ "$hp" =~ ^\[([^\]]+)\]:([^:]*)$ ]]; then
     HP_HOST="${BASH_REMATCH[1]}"
     HP_PORT="${BASH_REMATCH[2]}"
   elif [[ "$hp" =~ ^\[([^\]]+)\]$ ]]; then
     HP_HOST="${BASH_REMATCH[1]}"
     HP_PORT="$default_port"
+  elif [[ "$hp" == *:*:* ]]; then
+    echo "IPv6 地址请使用方括号格式 [ipv6]:port" >&2
+    return 1
   elif [[ "$hp" == *:* ]]; then
     HP_HOST="${hp%:*}"
     HP_PORT="${hp##*:}"
   else
     HP_HOST="$hp"
     HP_PORT="$default_port"
+  fi
+
+  if [[ "$HP_PORT" == "$default_port" && "$default_port" == "0" ]]; then
+    return 0
+  fi
+  if ! is_valid_port "$HP_PORT"; then
+    echo "端口号无效: ${HP_PORT:-<空>}（有效范围 1-65535）" >&2
+    return 1
   fi
 }
 
@@ -181,6 +211,7 @@ BASE_CONFIG_JSON=""
 INBOUNDS_JSON="[]"
 OUTBOUNDS_JSON="[]"
 
+# 返回值: 0=加载成功, 1=文件不存在, 2=文件存在但无法解析为合法 JSON 对象
 load_existing_config() {
   local file="$1"
   BASE_CONFIG_JSON=""
@@ -191,8 +222,7 @@ load_existing_config() {
     return 1
   fi
   if ! jq -e 'type == "object"' "$file" >/dev/null 2>&1; then
-    echo "警告：检测到 ${file}，但不是合法的 JSON 对象（可能是含注释的 JSONC 或格式损坏）。" >&2
-    return 1
+    return 2
   fi
 
   BASE_CONFIG_JSON="$(cat "$file")"
@@ -533,7 +563,9 @@ parse_vless_link() {
   local user_id hostport
   user_id="$(url_decode "${authority%@*}")"
   hostport="${authority##*@}"
-  split_host_port "$hostport" 443
+  if ! split_host_port "$hostport" 443; then
+    return 1
+  fi
   if [[ -z "$HP_HOST" || -z "$user_id" ]]; then
     echo "VLESS 链接缺少服务器地址或 UUID" >&2
     return 1
@@ -601,7 +633,9 @@ parse_vmess_link() {
     local user_id hostport
     user_id="$(url_decode "${authority%@*}")"
     hostport="${authority##*@}"
-    split_host_port "$hostport" 443
+    if ! split_host_port "$hostport" 443; then
+      return 1
+    fi
     if [[ -z "$HP_HOST" || -z "$user_id" ]]; then
       echo "VMess AEAD 链接缺少地址或 UUID" >&2
       return 1
@@ -657,7 +691,10 @@ parse_vmess_link() {
 
   local addr port user_id scy net tls_flag security host path sni fp alpn htype
   addr="$(printf '%s' "$decoded_json" | jq -r '.add // ""')"
-  port="$(printf '%s' "$decoded_json" | jq -r '(.port // 443) | tonumber')"
+  port="$(printf '%s' "$decoded_json" | jq -r '
+    if (.port == null or .port == "") then 443
+    else (.port | tonumber? // "") end
+  ')"
   user_id="$(printf '%s' "$decoded_json" | jq -r '.id // ""')"
   scy="$(printf '%s' "$decoded_json" | jq -r '.scy // "auto"')"
   [[ -z "$scy" ]] && scy="auto"
@@ -676,9 +713,21 @@ parse_vmess_link() {
     echo "VMess JSON 缺少 add 或 id 字段" >&2
     return 1
   fi
+  if ! is_valid_port "$port"; then
+    echo "VMess JSON 端口无效: ${port:-<空>}" >&2
+    return 1
+  fi
+
+  local vmess_mode="" net_lower
+  net_lower="$(printf '%s' "$net" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$net_lower" == "grpc" && "$htype" == "multi" ]]; then
+    vmess_mode="multi"
+  elif [[ ( "$net_lower" == "xhttp" || "$net_lower" == "splithttp" ) && -n "$htype" && "$htype" != "none" ]]; then
+    vmess_mode="$htype"
+  fi
 
   local stream_json
-  stream_json="$(build_stream_settings "$net" "$security" "$addr" "$path" "$host" "$htype" "$htype" "$path" "" "" "" "$sni" "$fp" "$alpn")"
+  stream_json="$(build_stream_settings "$net" "$security" "$addr" "$path" "$host" "$htype" "$vmess_mode" "" "" "" "" "$sni" "$fp" "$alpn")"
 
   jq -n \
     --arg tag "$tag" \
@@ -719,7 +768,9 @@ parse_trojan_link() {
   local password hostport
   password="$(url_decode "${authority%@*}")"
   hostport="${authority##*@}"
-  split_host_port "$hostport" 443
+  if ! split_host_port "$hostport" 443; then
+    return 1
+  fi
   if [[ -z "$HP_HOST" || -z "$password" ]]; then
     echo "Trojan 链接缺少地址或密码" >&2
     return 1
@@ -813,9 +864,11 @@ parse_ss_link() {
     password="${userinfo#*:}"
   fi
 
-  split_host_port "$hostport" 0
-  if [[ -z "$HP_HOST" || "$HP_PORT" -eq 0 ]]; then
-    echo "Shadowsocks 缺少服务器地址或端口" >&2
+  if ! split_host_port "$hostport" 0; then
+    return 1
+  fi
+  if [[ -z "$HP_HOST" ]] || ! is_valid_port "$HP_PORT"; then
+    echo "Shadowsocks 缺少有效的服务器地址或端口" >&2
     return 1
   fi
 
@@ -907,7 +960,9 @@ parse_socks_http_link() {
     fi
   fi
 
-  split_host_port "$hostport" "$default_port"
+  if ! split_host_port "$hostport" "$default_port"; then
+    return 1
+  fi
   if [[ -z "$HP_HOST" ]]; then
     echo "${scheme} 链接缺少服务器地址" >&2
     return 1
@@ -1053,7 +1108,10 @@ build_inbounds_interactive() {
     decryption="$(ask "decryption (none 或 xray vlessenc 生成的解密串)" "none")"
     flow="$(ask "flow 流控 (如 xtls-rprx-vision，留空不启用)" "")"
     network="$(ask "传输方式 (raw/ws/grpc/xhttp)" "raw")"
+    network="$(printf '%s' "$network" | tr '[:upper:]' '[:lower:]')"
+    [[ "$network" == "splithttp" ]] && network="xhttp"
     security="$(ask "外层安全 (none/tls/reality)" "none")"
+    security="$(printf '%s' "$security" | tr '[:upper:]' '[:lower:]')"
 
     local path="" sname="" cert="" key="" target="" snis="" priv_key="" sids=""
     case "$network" in
@@ -1256,13 +1314,16 @@ configure_manual_outbound() {
   case "$choice" in
     1)
       local addr port uid enc flow net sec path="" host="" mode="" sname="" sni="" fp="" pbk="" sid="" spx=""
-      addr="$(ask "服务器地址")"
+      addr="$(ask_required "服务器地址")"
       port="$(ask_port "服务器端口" "443")"
-      uid="$(ask "UUID")"
+      uid="$(ask_required "UUID")"
       enc="$(ask "encryption (none 或 mlkem768x25519plus...)" "none")"
       flow="$(ask "flow (如 xtls-rprx-vision，留空不启用)" "")"
       net="$(ask "传输方式 (raw/ws/grpc/xhttp)" "raw")"
+      net="$(printf '%s' "$net" | tr '[:upper:]' '[:lower:]')"
+      [[ "$net" == "splithttp" ]] && net="xhttp"
       sec="$(ask "外层安全 (none/tls/reality)" "none")"
+      sec="$(printf '%s' "$sec" | tr '[:upper:]' '[:lower:]')"
 
       if [[ "$net" == "ws" || "$net" == "xhttp" || "$net" == "httpupgrade" ]]; then
         path="$(ask "Path" "/")"
@@ -1278,7 +1339,7 @@ configure_manual_outbound() {
       elif [[ "$sec" == "reality" ]]; then
         sni="$(ask "REALITY serverName (SNI)" "www.microsoft.com")"
         fp="$(ask "uTLS 指纹" "chrome")"
-        pbk="$(ask "REALITY publicKey")"
+        pbk="$(ask_required "REALITY publicKey")"
         sid="$(ask "REALITY shortId (可留空)" "")"
         spx="$(ask "REALITY spiderX (可留空)" "")"
       fi
@@ -1307,12 +1368,14 @@ configure_manual_outbound() {
 
     2)
       local addr port uid scy net sec path="" host="" sname="" sni=""
-      addr="$(ask "服务器地址")"
+      addr="$(ask_required "服务器地址")"
       port="$(ask_port "服务器端口" "443")"
-      uid="$(ask "UUID")"
+      uid="$(ask_required "UUID")"
       scy="$(ask "加密方式 (auto/aes-128-gcm/chacha20-poly1305/none)" "auto")"
       net="$(ask "传输方式 (tcp/ws/grpc)" "ws")"
+      net="$(printf '%s' "$net" | tr '[:upper:]' '[:lower:]')"
       sec="$(ask "外层安全 (none/tls)" "tls")"
+      sec="$(printf '%s' "$sec" | tr '[:upper:]' '[:lower:]')"
       if [[ "$net" == "ws" ]]; then
         path="$(ask "WS Path" "/")"
         host="$(ask "WS Host" "$addr")"
@@ -1340,24 +1403,34 @@ configure_manual_outbound() {
       ;;
 
     3)
-      local addr port pwd net sec sni="" fp="" pbk="" sid=""
-      addr="$(ask "服务器地址")"
+      local addr port pwd net sec path="" host="" sname="" sni="" fp="" pbk="" sid=""
+      addr="$(ask_required "服务器地址")"
       port="$(ask_port "服务器端口" "443")"
-      pwd="$(ask "Trojan 密码")"
+      pwd="$(ask_required "Trojan 密码")"
       net="$(ask "传输方式 (raw/ws/grpc)" "raw")"
+      net="$(printf '%s' "$net" | tr '[:upper:]' '[:lower:]')"
       sec="$(ask "外层安全 (tls/reality/none)" "tls")"
+      sec="$(printf '%s' "$sec" | tr '[:upper:]' '[:lower:]')"
+
+      if [[ "$net" == "ws" ]]; then
+        path="$(ask "WS Path" "/")"
+        host="$(ask "WS Host (可留空)" "")"
+      elif [[ "$net" == "grpc" ]]; then
+        sname="$(ask "gRPC serviceName" "")"
+      fi
+
       if [[ "$sec" == "tls" ]]; then
         sni="$(ask "SNI" "$addr")"
         fp="$(ask "uTLS 指纹" "chrome")"
       elif [[ "$sec" == "reality" ]]; then
         sni="$(ask "REALITY SNI" "www.microsoft.com")"
-        pbk="$(ask "REALITY publicKey")"
+        pbk="$(ask_required "REALITY publicKey")"
         sid="$(ask "REALITY shortId" "")"
         fp="$(ask "uTLS 指纹" "chrome")"
       fi
 
       local stream_json
-      stream_json="$(build_stream_settings "$net" "$sec" "$addr" "" "" "" "" "" "" "" "" "$sni" "$fp" "" "" "" "$pbk" "$sid")"
+      stream_json="$(build_stream_settings "$net" "$sec" "$addr" "$path" "$host" "" "" "$sname" "" "" "" "$sni" "$fp" "" "" "" "$pbk" "$sid")"
       jq -n \
         --arg tag "$tag" \
         --arg addr "$addr" \
@@ -1375,10 +1448,10 @@ configure_manual_outbound() {
 
     4)
       local addr port method pwd
-      addr="$(ask "服务器地址")"
+      addr="$(ask_required "服务器地址")"
       port="$(ask_port "服务器端口" "8388")"
       method="$(ask "加密方式" "2022-blake3-aes-128-gcm")"
-      pwd="$(ask "密码")"
+      pwd="$(ask_required "密码")"
       jq -n \
         --arg tag "$tag" \
         --arg addr "$addr" \
@@ -1397,11 +1470,11 @@ configure_manual_outbound() {
       local proto="socks" proto_upper="SOCKS" dport=1080
       [[ "$choice" == "6" ]] && { proto="http"; proto_upper="HTTP"; dport=8080; }
       local addr port user="" pass=""
-      addr="$(ask "${proto_upper} 代理地址")"
+      addr="$(ask_required "${proto_upper} 代理地址")"
       port="$(ask_port "${proto_upper} 代理端口" "$dport")"
       if ask_yes_no "上游代理是否需要账号密码" "n"; then
-        user="$(ask "用户名")"
-        pass="$(ask "密码")"
+        user="$(ask_required "用户名")"
+        pass="$(ask_required "密码")"
       fi
       jq -n \
         --arg tag "$tag" \
@@ -1443,8 +1516,11 @@ build_single_outbound_interactive() {
 
   case "$choice" in
     1)
-      local tag strategy
-      tag="$(ask "出站 tag" "direct")"
+      local tag strategy direct_default="direct"
+      if [[ "$(printf '%s' "$OUTBOUNDS_JSON" | jq '[.[] | select(.tag == "direct")] | length')" -gt 0 ]]; then
+        direct_default="$default_tag"
+      fi
+      tag="$(ask "出站 tag" "$direct_default")"
       strategy="$(ask "域名解析策略 (AsIs / UseIP / UseIPv4 / UseIPv6)" "AsIs")"
       jq -n --arg tag "$tag" --arg s "$strategy" \
         '{ tag: $tag, protocol: "freedom", settings: { domainStrategy: $s } }'
@@ -1482,15 +1558,13 @@ configure_full_outbounds_interactive() {
 
   if [[ "$proto" == "freedom" ]]; then
     OUTBOUNDS_JSON="$(jq -n --argjson p "$primary" '
-      [ $p, { tag: "block", protocol: "blackhole" } ]
+      [ $p ] + (if $p.tag != "block" then [{ tag: "block", protocol: "blackhole" }] else [] end)
     ')"
   else
     OUTBOUNDS_JSON="$(jq -n --argjson p "$primary" '
-      [
-        $p,
-        { tag: "direct", protocol: "freedom" },
-        { tag: "block", protocol: "blackhole" }
-      ]
+      [ $p ]
+      + (if $p.tag != "direct" then [{ tag: "direct", protocol: "freedom" }] else [] end)
+      + (if $p.tag != "block" then [{ tag: "block", protocol: "blackhole" }] else [] end)
     ')"
   fi
 }
@@ -1605,8 +1679,42 @@ copy_file_mode() {
   fi
 }
 
+update_inbound_endpoint() {
+  local idx="$1"
+  local set_listen="$2"
+  local listen_val="$3"
+  local set_port="$4"
+  local port_val="$5"
+
+  local count
+  count="$(printf '%s' "$INBOUNDS_JSON" | jq 'length')"
+  if (( count == 0 )); then
+    echo "错误：当前配置中没有入站，无法修改监听地址或端口（如需新建请同时传入 --in-proto）。" >&2
+    return 1
+  fi
+  if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > count )); then
+    echo "错误：入站序号 ${idx} 无效（当前共 ${count} 条入站）。" >&2
+    return 1
+  fi
+
+  local zero_idx=$((idx - 1))
+  INBOUNDS_JSON="$(printf '%s' "$INBOUNDS_JSON" | jq \
+    --argjson i "$zero_idx" \
+    --argjson set_listen "$set_listen" \
+    --arg listen "$listen_val" \
+    --argjson set_port "$set_port" \
+    --argjson port "${port_val:-0}" '
+    .[$i] |= (
+      (if $set_listen then .listen = $listen else . end)
+      | (if $set_port then .port = $port else . end)
+    )
+  ')"
+  echo "已更新第 ${idx} 条入站的监听设置。" >&2
+}
+
 save_config() {
   local output="$1"
+  local allow_force="${2:-false}"
   local final_json
 
   if [[ -n "$BASE_CONFIG_JSON" ]]; then
@@ -1626,10 +1734,20 @@ save_config() {
     ')"
   fi
 
+  if [[ -f "$output" ]] && jq -e --argjson new "$final_json" '. == $new' "$output" >/dev/null 2>&1; then
+    echo "配置内容未发生变化，跳过写入。"
+    return 0
+  fi
+
   local output_dir tmp_file
   output_dir="$(dirname "$output")"
   tmp_file="$(mktemp "${output_dir}/.xray_config.tmp.XXXXXX")"
   if ! printf '%s\n' "$final_json" > "$tmp_file"; then
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  if ! validate_with_xray "$tmp_file" "$allow_force" "$output"; then
     rm -f "$tmp_file"
     return 1
   fi
@@ -1653,20 +1771,37 @@ save_config() {
     return 1
   fi
   echo "已成功写入配置：${output}"
+
+  if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
+    local cur_mode=""
+    cur_mode="$(stat -c '%a' "$output" 2>/dev/null || stat -f '%Lp' "$output" 2>/dev/null || true)"
+    if [[ "$cur_mode" == "600" ]]; then
+      echo "提示：${output} 当前权限为 600；若 xray.service 以非 root 用户运行，请执行 chmod 644 ${output}" >&2
+    fi
+  fi
 }
 
 validate_with_xray() {
   local cfg="$1"
+  local allow_force="${2:-false}"
+  local target_label="${3:-$cfg}"
   if command -v xray >/dev/null 2>&1; then
     echo ""
-    echo "检测到本地 xray，正在执行配置校验..."
+    echo "检测到本地 xray，正在执行写入前配置校验..."
     if xray run -test -c "$cfg"; then
       echo "校验通过。"
-    else
-      echo "警告：xray 配置校验未通过，请检查上方输出（可使用 ${cfg}.bak 恢复）。" >&2
+      return 0
     fi
+    if [[ "$allow_force" == "true" && -t 0 ]]; then
+      if ask_yes_no "警告：xray 配置校验未通过，是否仍强制写入 ${target_label}" "n"; then
+        return 0
+      fi
+    fi
+    echo "错误：xray 配置校验未通过，已取消写入（原配置未被修改）。" >&2
+    return 1
   else
     echo "未在 PATH 中检测到 xray，已跳过自动校验。"
+    return 0
   fi
 }
 
@@ -1703,9 +1838,9 @@ download_to_file() {
   local url="$1"
   local dest="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 15 --max-time 60 -o "$dest" "$url"
+    curl -fsSL -H "Cache-Control: no-cache" --connect-timeout 15 --max-time 60 -o "$dest" "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=15 -O "$dest" "$url"
+    wget -q --no-cache --timeout=15 -O "$dest" "$url"
   else
     echo "错误：未找到 curl 或 wget，无法下载更新。" >&2
     return 1
@@ -1784,14 +1919,14 @@ usage() {
 选项:
   -c, -o, --output <file>   指定配置文件路径 (默认: ./config.json)
   -s, --show                读取并展示当前配置文件的入站与出站信息后退出
-      --in-proto <proto>    快捷模式入站协议: socks 或 http（单独传入时仅修改入站）
-      --listen <addr>       快捷模式入站监听地址 (默认: 127.0.0.1)
-      --port <port>         快捷模式入站监听端口 (默认: 10808)
+      --in-proto <proto>    快捷模式重建入站协议: socks 或 http（单独传入时仅修改入站）
+      --listen <addr>       入站监听地址 (新建默认: 127.0.0.1；已有配置未传 --in-proto 时原地修改 --in-index 指定入站)
+      --port <port>         入站监听端口 (新建默认: 10808；已有配置未传 --in-proto 时原地修改 --in-index 指定入站)
       --tls-cert <path>     设置入站 TLS 证书文件路径 (certificateFile)
       --tls-key <path>      设置入站 TLS 私钥文件路径 (keyFile)
-      --in-index <num>      指定设置 TLS 路径的入站序号 (从 1 开始，默认: 1)
+      --in-index <num>      指定操作的入站序号，用于 TLS 或原地修改监听/端口 (从 1 开始，默认: 1)
       --out-index <num>     将指定序号的出站切换为默认主出站 (从 1 开始，置顶到第 1 条)
-      --direct              快捷模式将主出站切换为直连（单独传入时仅修改出站）
+      --direct              快捷模式将主出站切换为直连（已有 direct 出站时优先置顶，避免重复 tag）
       --link <uri>          快捷模式从分享链接解析主出站（单独传入时仅修改出站）
       --fresh               忽略现有 config.json，强制生成全新配置
   -u, --update              检查并更新当前脚本到最新版本后退出
@@ -1822,7 +1957,9 @@ main() {
   local out_index=""
   local use_direct="false"
   local link=""
-  local has_in_args="false"
+  local has_in_proto="false"
+  local has_listen_arg="false"
+  local has_port_arg="false"
   local has_tls_args="false"
   local has_out_args="false"
 
@@ -1833,9 +1970,9 @@ main() {
       --fresh)        fresh_mode="true"; shift ;;
       -u|--update)    do_update="true"; shift ;;
       --update-url)   require_arg "$1" "${2:-}"; update_url="$2"; shift 2 ;;
-      --in-proto)     require_arg "$1" "${2:-}"; in_proto="$2"; has_in_args="true"; shift 2 ;;
-      --listen)       require_arg "$1" "${2:-}"; listen="$2"; has_in_args="true"; shift 2 ;;
-      --port)         require_arg "$1" "${2:-}"; port="$2"; has_in_args="true"; shift 2 ;;
+      --in-proto)     require_arg "$1" "${2:-}"; in_proto="$2"; has_in_proto="true"; shift 2 ;;
+      --listen)       require_arg "$1" "${2:-}"; listen="$2"; has_listen_arg="true"; shift 2 ;;
+      --port)         require_arg "$1" "${2:-}"; port="$2"; has_port_arg="true"; shift 2 ;;
       --tls-cert)     require_arg "$1" "${2:-}"; tls_cert="$2"; has_tls_args="true"; shift 2 ;;
       --tls-key)      require_arg "$1" "${2:-}"; tls_key="$2"; has_tls_args="true"; shift 2 ;;
       --in-index)     require_arg "$1" "${2:-}"; in_index="$2"; shift 2 ;;
@@ -1858,33 +1995,46 @@ main() {
 
   check_deps
 
+  if [[ "$has_port_arg" == "true" ]] && ! is_valid_port "$port"; then
+    echo "错误：--port 端口号无效: ${port}（有效范围 1-65535，不含前导零）。" >&2
+    exit 1
+  fi
+
   local has_existing="false"
-  if [[ "$fresh_mode" == "false" ]] && load_existing_config "$config_file"; then
-    has_existing="true"
+  if [[ "$fresh_mode" == "false" ]]; then
+    local load_rc=0
+    load_existing_config "$config_file" || load_rc=$?
+    if (( load_rc == 0 )); then
+      has_existing="true"
+    elif (( load_rc == 2 )); then
+      echo "错误：${config_file} 已存在但不是合法的 JSON 对象（可能含注释的 JSONC 或格式损坏）。" >&2
+      echo "请先修复/移除注释，或使用 --fresh 强制重新生成（原文件会自动备份为 .bak）。" >&2
+      exit 1
+    fi
   fi
 
   # 仅查看模式
   if [[ "$show_only" == "true" ]]; then
     if [[ "$has_existing" == "false" ]]; then
-      echo "错误：未找到有效的配置文件 ${config_file}" >&2
+      echo "错误：未找到配置文件 ${config_file}" >&2
       exit 1
     fi
     show_config_summary "$config_file"
     exit 0
   fi
 
-  # 命令行快捷模式（支持只改入站、只改 TLS 路径或只改出站）
-  if [[ "$has_in_args" == "true" || "$has_tls_args" == "true" || "$has_out_args" == "true" || -n "$out_index" ]]; then
+  # 命令行快捷模式（支持只改入站、只改监听/端口、只改 TLS 路径或只改出站）
+  if [[ "$has_in_proto" == "true" || "$has_listen_arg" == "true" || "$has_port_arg" == "true" || "$has_tls_args" == "true" || "$has_out_args" == "true" || -n "$out_index" ]]; then
     if [[ -n "$out_index" && "$has_out_args" == "true" ]]; then
       echo "错误：--out-index 不能与 --direct 或 --link 同时使用。" >&2
       exit 1
     fi
+    if [[ -n "$out_index" && "$has_existing" == "false" ]]; then
+      echo "错误：未找到有效的配置文件 ${config_file}，无法通过 --out-index 切换出站。" >&2
+      exit 1
+    fi
 
-    if [[ "$has_in_args" == "true" || "$has_existing" == "false" ]]; then
-      if [[ -n "$out_index" && "$has_existing" == "false" ]]; then
-        echo "错误：未找到有效的配置文件 ${config_file}，无法通过 --out-index 切换出站。" >&2
-        exit 1
-      fi
+    if [[ "$has_in_proto" == "true" || "$has_existing" == "false" ]]; then
       in_proto="${in_proto:-socks}"
       in_proto="$(printf '%s' "$in_proto" | tr '[:upper:]' '[:lower:]')"
       if [[ "$in_proto" == "socks" ]]; then
@@ -1913,6 +2063,8 @@ main() {
         echo "错误：快捷模式 --in-proto 仅支持 socks 或 http。" >&2
         exit 1
       fi
+    elif [[ "$has_listen_arg" == "true" || "$has_port_arg" == "true" ]]; then
+      update_inbound_endpoint "$in_index" "$has_listen_arg" "$listen" "$has_port_arg" "$port"
     fi
 
     if [[ "$has_tls_args" == "true" ]]; then
@@ -1937,8 +2089,12 @@ main() {
           ')"
         fi
       else
-        local direct_out='{"tag":"direct","protocol":"freedom"}'
-        if [[ "$has_existing" == "true" && "$(printf '%s' "$OUTBOUNDS_JSON" | jq 'length')" -gt 0 ]]; then
+        local direct_idx
+        direct_idx="$(printf '%s' "$OUTBOUNDS_JSON" | jq '([to_entries[] | select(.value.protocol == "freedom" and .value.tag == "direct") | .key + 1][0]) // 0')"
+        if [[ "$has_existing" == "true" && "$direct_idx" -gt 0 ]]; then
+          set_primary_outbound "$direct_idx"
+        elif [[ "$has_existing" == "true" && "$(printf '%s' "$OUTBOUNDS_JSON" | jq 'length')" -gt 0 ]]; then
+          local direct_out='{"tag":"direct","protocol":"freedom"}'
           OUTBOUNDS_JSON="$(printf '%s' "$OUTBOUNDS_JSON" | jq --argjson d "$direct_out" '.[0] = $d')"
         else
           OUTBOUNDS_JSON='[
@@ -1949,14 +2105,15 @@ main() {
       fi
     fi
 
-    save_config "$config_file"
+    save_config "$config_file" "false"
     show_config_summary "$config_file"
-    validate_with_xray "$config_file"
     exit 0
   fi
 
   # 交互式模式
   if [[ "$has_existing" == "true" ]]; then
+    local orig_inbounds="$INBOUNDS_JSON"
+    local orig_outbounds="$OUTBOUNDS_JSON"
     show_config_summary "$config_file"
     echo "请选择要执行的操作：" >&2
     echo "  1) 只修改入站 (覆盖/追加/删除/TLS路径)" >&2
@@ -2003,6 +2160,10 @@ main() {
         exit 1
         ;;
     esac
+    if [[ "$action" != "5" && "$INBOUNDS_JSON" == "$orig_inbounds" && "$OUTBOUNDS_JSON" == "$orig_outbounds" ]]; then
+      echo "配置未发生变化，已退出。"
+      exit 0
+    fi
     config_file="$(ask "保存配置文件路径" "$config_file")"
   else
     echo "未在当前目录检测到有效的 ${config_file}，将为您生成新配置。" >&2
@@ -2011,9 +2172,8 @@ main() {
     config_file="$(ask "输出文件路径" "$config_file")"
   fi
 
-  save_config "$config_file"
+  save_config "$config_file" "true"
   show_config_summary "$config_file"
-  validate_with_xray "$config_file"
 }
 
 main "$@"
