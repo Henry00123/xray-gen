@@ -1590,6 +1590,21 @@ edit_existing_outbounds_interactive() {
 
 # ==================== 写入与校验 ====================
 
+copy_file_mode() {
+  local src="$1"
+  local dst="$2"
+  local fallback="${3:-644}"
+  if ! chmod --reference="$src" "$dst" 2>/dev/null; then
+    local mode=""
+    mode="$(stat -c '%a' "$src" 2>/dev/null || stat -f '%Lp' "$src" 2>/dev/null || true)"
+    if [[ -n "$mode" ]]; then
+      chmod "$mode" "$dst" 2>/dev/null || chmod "$fallback" "$dst"
+    else
+      chmod "$fallback" "$dst"
+    fi
+  fi
+}
+
 save_config() {
   local output="$1"
   local final_json
@@ -1611,15 +1626,32 @@ save_config() {
     ')"
   fi
 
-  if [[ -f "$output" ]]; then
-    cp "$output" "${output}.bak"
-    echo "已自动备份原配置至：${output}.bak"
+  local output_dir tmp_file
+  output_dir="$(dirname "$output")"
+  tmp_file="$(mktemp "${output_dir}/.xray_config.tmp.XXXXXX")"
+  if ! printf '%s\n' "$final_json" > "$tmp_file"; then
+    rm -f "$tmp_file"
+    return 1
   fi
 
-  local tmp_file
-  tmp_file="$(mktemp)"
-  printf '%s\n' "$final_json" > "$tmp_file"
-  mv "$tmp_file" "$output"
+  if [[ -f "$output" ]]; then
+    copy_file_mode "$output" "$tmp_file" "644"
+    if ! chown --reference="$output" "$tmp_file" 2>/dev/null; then
+      local owner=""
+      owner="$(stat -c '%u:%g' "$output" 2>/dev/null || stat -f '%u:%g' "$output" 2>/dev/null || true)"
+      [[ -n "$owner" ]] && chown "$owner" "$tmp_file" 2>/dev/null || true
+    fi
+    cp -p "$output" "${output}.bak" 2>/dev/null || cp "$output" "${output}.bak"
+    echo "已自动备份原配置至：${output}.bak"
+  else
+    chmod 644 "$tmp_file"
+  fi
+
+  if ! mv -f "$tmp_file" "$output"; then
+    rm -f "$tmp_file"
+    echo "错误：写入配置文件失败：${output}" >&2
+    return 1
+  fi
   echo "已成功写入配置：${output}"
 }
 
@@ -1727,15 +1759,7 @@ self_update() {
     return 0
   fi
 
-  if ! chmod --reference="$target_path" "$tmp_file" 2>/dev/null; then
-    local mode=""
-    mode="$(stat -c '%a' "$target_path" 2>/dev/null || stat -f '%Lp' "$target_path" 2>/dev/null || true)"
-    if [[ -n "$mode" ]]; then
-      chmod "$mode" "$tmp_file" 2>/dev/null || chmod 755 "$tmp_file"
-    else
-      chmod 755 "$tmp_file"
-    fi
-  fi
+  copy_file_mode "$target_path" "$tmp_file" "755"
   chmod +x "$tmp_file" 2>/dev/null || true
 
   if ! mv -f "$tmp_file" "$target_path"; then
