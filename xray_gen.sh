@@ -1495,6 +1495,34 @@ configure_full_outbounds_interactive() {
   fi
 }
 
+set_primary_outbound() {
+  local idx="$1"
+  local count
+  count="$(printf '%s' "$OUTBOUNDS_JSON" | jq 'length')"
+  if (( count == 0 )); then
+    echo "错误：当前配置中没有出站，无法切换默认主出站。" >&2
+    return 1
+  fi
+  if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > count )); then
+    echo "错误：出站序号 ${idx} 无效（当前共 ${count} 条出站）。" >&2
+    return 1
+  fi
+
+  local zero_idx=$((idx - 1))
+  local tag
+  tag="$(printf '%s' "$OUTBOUNDS_JSON" | jq -r --argjson i "$zero_idx" '.[$i].tag // "-"')"
+
+  if (( idx == 1 )); then
+    echo "第 1 条出站 (tag=${tag}) 当前已是默认主出站，无需切换。" >&2
+    return 0
+  fi
+
+  OUTBOUNDS_JSON="$(printf '%s' "$OUTBOUNDS_JSON" | jq --argjson i "$zero_idx" '
+    [.[$i]] + del(.[$i])
+  ')"
+  echo "已将第 ${idx} 条出站 (tag=${tag}) 设为默认主出站（第 1 条）。" >&2
+}
+
 edit_existing_outbounds_interactive() {
   echo "" >&2
   show_outbounds_summary "$OUTBOUNDS_JSON"
@@ -1503,8 +1531,9 @@ edit_existing_outbounds_interactive() {
   echo "  2) 重新配置全部出站 (重置为 主出站 + direct + block)" >&2
   echo "  3) 追加一条新出站" >&2
   echo "  4) 删除指定序号的出站" >&2
+  echo "  5) 切换指定序号出站为默认主出站 (置顶到第 1 条)" >&2
   local op
-  op="$(ask "请选择操作 (1-4)" "1")"
+  op="$(ask "请选择操作 (1-5)" "1")"
 
   case "$op" in
     1)
@@ -1541,6 +1570,16 @@ edit_existing_outbounds_interactive() {
       else
         echo "序号无效，未作修改。" >&2
       fi
+      ;;
+    5)
+      local count idx
+      count="$(printf '%s' "$OUTBOUNDS_JSON" | jq 'length')"
+      if (( count < 2 )); then
+        echo "当前不足 2 条出站，无需切换。" >&2
+        return
+      fi
+      idx="$(ask "请输入要设为默认主出站的序号 (1-${count})" "2")"
+      set_primary_outbound "$idx"
       ;;
     *)
       echo "无效操作。" >&2
@@ -1727,6 +1766,7 @@ usage() {
       --tls-cert <path>     设置入站 TLS 证书文件路径 (certificateFile)
       --tls-key <path>      设置入站 TLS 私钥文件路径 (keyFile)
       --in-index <num>      指定设置 TLS 路径的入站序号 (从 1 开始，默认: 1)
+      --out-index <num>     将指定序号的出站切换为默认主出站 (从 1 开始，置顶到第 1 条)
       --direct              快捷模式将主出站切换为直连（单独传入时仅修改出站）
       --link <uri>          快捷模式从分享链接解析主出站（单独传入时仅修改出站）
       --fresh               忽略现有 config.json，强制生成全新配置
@@ -1755,6 +1795,7 @@ main() {
   local tls_cert=""
   local tls_key=""
   local in_index="1"
+  local out_index=""
   local use_direct="false"
   local link=""
   local has_in_args="false"
@@ -1774,6 +1815,7 @@ main() {
       --tls-cert)     require_arg "$1" "${2:-}"; tls_cert="$2"; has_tls_args="true"; shift 2 ;;
       --tls-key)      require_arg "$1" "${2:-}"; tls_key="$2"; has_tls_args="true"; shift 2 ;;
       --in-index)     require_arg "$1" "${2:-}"; in_index="$2"; shift 2 ;;
+      --out-index)    require_arg "$1" "${2:-}"; out_index="$2"; shift 2 ;;
       --direct)       use_direct="true"; has_out_args="true"; shift ;;
       --link)         require_arg "$1" "${2:-}"; link="$2"; has_out_args="true"; shift 2 ;;
       -h|--help)      usage; exit 0 ;;
@@ -1808,8 +1850,17 @@ main() {
   fi
 
   # 命令行快捷模式（支持只改入站、只改 TLS 路径或只改出站）
-  if [[ "$has_in_args" == "true" || "$has_tls_args" == "true" || "$has_out_args" == "true" ]]; then
+  if [[ "$has_in_args" == "true" || "$has_tls_args" == "true" || "$has_out_args" == "true" || -n "$out_index" ]]; then
+    if [[ -n "$out_index" && "$has_out_args" == "true" ]]; then
+      echo "错误：--out-index 不能与 --direct 或 --link 同时使用。" >&2
+      exit 1
+    fi
+
     if [[ "$has_in_args" == "true" || "$has_existing" == "false" ]]; then
+      if [[ -n "$out_index" && "$has_existing" == "false" ]]; then
+        echo "错误：未找到有效的配置文件 ${config_file}，无法通过 --out-index 切换出站。" >&2
+        exit 1
+      fi
       in_proto="${in_proto:-socks}"
       in_proto="$(printf '%s' "$in_proto" | tr '[:upper:]' '[:lower:]')"
       if [[ "$in_proto" == "socks" ]]; then
@@ -1844,7 +1895,9 @@ main() {
       apply_tls_to_inbound "$in_index" "$tls_cert" "$tls_key"
     fi
 
-    if [[ "$has_out_args" == "true" || "$has_existing" == "false" ]]; then
+    if [[ -n "$out_index" ]]; then
+      set_primary_outbound "$out_index"
+    elif [[ "$has_out_args" == "true" || "$has_existing" == "false" ]]; then
       if [[ -n "$link" ]]; then
         local proxy_out
         proxy_out="$(parse_share_link "$link" "proxy")"
