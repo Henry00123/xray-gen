@@ -32,16 +32,78 @@ if ! printf 'YQ==' | base64 -d >/dev/null 2>&1; then
   B64_DEC_FLAG="-D"
 fi
 
-# ==================== 通用辅助函数 ====================
+# ==================== 终端样式与通用辅助函数 ====================
+
+C_RESET=""
+C_BOLD=""
+C_DIM=""
+C_CYAN=""
+C_GREEN=""
+C_YELLOW=""
+C_RED=""
+
+if [[ -t 2 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_RED=$'\033[31m'
+fi
+
+ui_hr() {
+  printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET" >&2
+}
+
+ui_header() {
+  local title="$1"
+  local subtitle="${2:-}"
+  echo "" >&2
+  ui_hr
+  if [[ -n "$subtitle" ]]; then
+    printf '  %s%s◆ %s%s  %s%s%s\n' "$C_BOLD" "$C_CYAN" "$title" "$C_RESET" "$C_DIM" "$subtitle" "$C_RESET" >&2
+  else
+    printf '  %s%s◆ %s%s\n' "$C_BOLD" "$C_CYAN" "$title" "$C_RESET" >&2
+  fi
+  ui_hr
+}
+
+ui_section() {
+  local title="$1"
+  local note="${2:-}"
+  if [[ -n "$note" ]]; then
+    printf '%s%s▸ %s%s %s%s%s\n' "$C_BOLD" "$C_CYAN" "$title" "$C_RESET" "$C_DIM" "$note" "$C_RESET" >&2
+  else
+    printf '%s%s▸ %s%s\n' "$C_BOLD" "$C_CYAN" "$title" "$C_RESET" >&2
+  fi
+}
+
+ui_item() {
+  local key="$1"
+  local label="$2"
+  local desc="${3:-}"
+  local color="${4:-$C_CYAN}"
+  if [[ -n "$desc" ]]; then
+    printf '  %s%s[%s]%s %s%s%s %s— %s%s\n' \
+      "$C_BOLD" "$color" "$key" "$C_RESET" \
+      "$C_BOLD" "$label" "$C_RESET" \
+      "$C_DIM" "$desc" "$C_RESET" >&2
+  else
+    printf '  %s%s[%s]%s %s%s%s\n' \
+      "$C_BOLD" "$color" "$key" "$C_RESET" \
+      "$C_BOLD" "$label" "$C_RESET" >&2
+  fi
+}
 
 ask() {
   local prompt="$1"
   local default="${2:-}"
   local val=""
   if [[ -n "$default" ]]; then
-    read -r -p "${prompt} [${default}]: " val
+    read -r -p "${C_CYAN}❯${C_RESET} ${prompt} ${C_DIM}[${default}]${C_RESET}: " val
   else
-    read -r -p "${prompt}: " val
+    read -r -p "${C_CYAN}❯${C_RESET} ${prompt}: " val
   fi
   val="${val#"${val%%[![:space:]]*}"}"
   val="${val%"${val##*[![:space:]]}"}"
@@ -91,7 +153,7 @@ ask_yes_no() {
   local hint="y/N"
   [[ "$default" == "y" ]] && hint="Y/n"
   local val=""
-  read -r -p "${prompt} (${hint}): " val
+  read -r -p "${C_CYAN}❯${C_RESET} ${prompt} ${C_DIM}(${hint})${C_RESET}: " val
   val="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
   if [[ -z "$val" ]]; then
     [[ "$default" == "y" ]]
@@ -235,33 +297,39 @@ show_inbounds_summary() {
   local json_arr="$1"
   local count
   count="$(printf '%s' "$json_arr" | jq 'length')"
-  echo "--- 当前入站 (inbounds: ${count} 条) ---" >&2
+  ui_section "入站列表" "(inbounds: ${count} 条)"
   if (( count == 0 )); then
-    echo "  (无入站配置)" >&2
+    printf '  %s(无入站配置)%s\n' "$C_DIM" "$C_RESET" >&2
     return
   fi
-  printf '%s' "$json_arr" | jq -r '
+  printf '%s' "$json_arr" | jq -r \
+    --arg r "$C_RESET" \
+    --arg b "$C_BOLD" \
+    --arg d "$C_DIM" \
+    --arg c "$C_CYAN" \
+    --arg y "$C_YELLOW" \
+    --arg g "$C_GREEN" '
     to_entries[] |
     (.key + 1) as $idx |
     .value as $v |
     (
       if $v.streamSettings then
-        " [\($v.streamSettings.network // "raw")/\($v.streamSettings.security // "none")]"
+        " \($c)[\($v.streamSettings.network // "raw")/\($v.streamSettings.security // "none")]\($r)"
       else "" end
     ) as $stream |
     (
       if ($v.protocol == "vless" and ($v.settings.decryption // "none") != "none") then
-        " (VLESS-Enc)"
+        " \($g)(VLESS-Enc)\($r)"
       elif ($v.protocol == "socks" and ($v.settings.auth // "noauth") == "password") then
-        " (auth:password)"
+        " \($g)(auth:password)\($r)"
       else "" end
     ) as $extra |
     (
       if (($v.streamSettings.tlsSettings.certificates // []) | type == "array" and length > 0) then
-        "\n      TLS cert: \($v.streamSettings.tlsSettings.certificates[0].certificateFile // "-")\n      TLS key:  \($v.streamSettings.tlsSettings.certificates[0].keyFile // "-")"
+        "\n      \($d)├─ TLS cert:\($r) \($v.streamSettings.tlsSettings.certificates[0].certificateFile // "-")\n      \($d)└─ TLS key: \($r) \($v.streamSettings.tlsSettings.certificates[0].keyFile // "-")"
       else "" end
     ) as $tls_info |
-    "  [\($idx)] tag=\($v.tag // "-") | \($v.protocol // "-") | \($v.listen // "0.0.0.0"):\($v.port // "-")\($stream)\($extra)\($tls_info)"
+    "  \($b)\($c)[\($idx)]\($r) \($d)tag=\($r)\($b)\($v.tag // "-")\($r) \($d)|\($r) \($y)\($v.protocol // "-")\($r) \($d)|\($r) \($v.listen // "0.0.0.0"):\($v.port // "-")\($stream)\($extra)\($tls_info)"
   ' >&2
 }
 
@@ -269,12 +337,18 @@ show_outbounds_summary() {
   local json_arr="$1"
   local count
   count="$(printf '%s' "$json_arr" | jq 'length')"
-  echo "--- 当前出站 (outbounds: ${count} 条，第 1 条为默认主出站) ---" >&2
+  ui_section "出站列表" "(outbounds: ${count} 条，第 1 条为默认主出站)"
   if (( count == 0 )); then
-    echo "  (无出站配置)" >&2
+    printf '  %s(无出站配置)%s\n' "$C_DIM" "$C_RESET" >&2
     return
   fi
-  printf '%s' "$json_arr" | jq -r '
+  printf '%s' "$json_arr" | jq -r \
+    --arg r "$C_RESET" \
+    --arg b "$C_BOLD" \
+    --arg d "$C_DIM" \
+    --arg c "$C_CYAN" \
+    --arg y "$C_YELLOW" \
+    --arg g "$C_GREEN" '
     to_entries[] |
     (.key + 1) as $idx |
     .value as $v |
@@ -293,25 +367,27 @@ show_outbounds_summary() {
     ) as $target |
     (
       if $v.streamSettings then
-        " [\($v.streamSettings.network // "raw")/\($v.streamSettings.security // "none")]"
+        " \($c)[\($v.streamSettings.network // "raw")/\($v.streamSettings.security // "none")]\($r)"
       else "" end
     ) as $stream |
     (
       if ($v.protocol == "vless" and ($v.settings.encryption // "none") != "none") then
-        " (VLESS-Enc)"
+        " \($g)(VLESS-Enc)\($r)"
       else "" end
     ) as $extra |
-    "  [\($idx)] tag=\($v.tag // "-") | \($v.protocol // "-") | \($target)\($stream)\($extra)"
+    (if $idx == 1 then "\($b)\($g)★\($r) " else "  " end) as $mark |
+    (if $idx == 1 then " \($g)(默认主出站)\($r)" else "" end) as $primary_badge |
+    "  \($b)\($c)[\($idx)]\($r) \($mark)\($d)tag=\($r)\($b)\($v.tag // "-")\($r) \($d)|\($r) \($y)\($v.protocol // "-")\($r) \($d)|\($r) \($target)\($stream)\($extra)\($primary_badge)"
   ' >&2
 }
 
 show_config_summary() {
   local file="$1"
-  echo "" >&2
-  echo "================ 当前配置文件摘要: ${file} ================" >&2
+  ui_header "Xray 配置摘要" "$file"
   show_inbounds_summary "$INBOUNDS_JSON"
+  echo "" >&2
   show_outbounds_summary "$OUTBOUNDS_JSON"
-  echo "==========================================================" >&2
+  ui_hr
 }
 
 # ==================== 设置/修改入站 TLS 证书路径 ====================
@@ -1024,13 +1100,14 @@ parse_share_link() {
 
 build_inbounds_interactive() {
   echo "" >&2
-  echo "=== 选择入站协议 ===" >&2
-  echo "  1) SOCKS5 (本地/局域网代理)" >&2
-  echo "  2) HTTP (本地/局域网代理)" >&2
-  echo "  3) SOCKS5 + HTTP (同时开启双端口)" >&2
-  echo "  4) VLESS (服务端入站，支持 VLESS Encryption / TLS / REALITY)" >&2
-  echo "  5) Shadowsocks (服务端入站)" >&2
-  echo "  6) Dokodemo-door (端口转发/透明代理)" >&2
+  ui_section "选择入站协议"
+  ui_item "1" "SOCKS5" "本地 / 局域网代理"
+  ui_item "2" "HTTP" "本地 / 局域网代理"
+  ui_item "3" "SOCKS5 + HTTP" "同时开启双端口"
+  ui_item "4" "VLESS" "服务端入站，支持 VLESS Encryption / TLS / REALITY"
+  ui_item "5" "Shadowsocks" "服务端入站"
+  ui_item "6" "Dokodemo-door" "端口转发 / 透明代理"
+  echo "" >&2
 
   local choice
   choice="$(ask "请选择入站类型 (1-6)" "1")"
@@ -1253,11 +1330,13 @@ build_inbounds_interactive() {
 edit_existing_inbounds_interactive() {
   echo "" >&2
   show_inbounds_summary "$INBOUNDS_JSON"
-  echo "入站修改方式：" >&2
-  echo "  1) 重新配置入站 (覆盖全部现有入站)" >&2
-  echo "  2) 追加新入站 (保留现有入站)" >&2
-  echo "  3) 删除指定序号的入站" >&2
-  echo "  4) 设置/修改指定入站的 TLS 证书路径" >&2
+  echo "" >&2
+  ui_section "入站修改方式"
+  ui_item "1" "重新配置入站" "覆盖全部现有入站" "$C_YELLOW"
+  ui_item "2" "追加新入站" "保留现有入站"
+  ui_item "3" "删除指定序号的入站" "" "$C_RED"
+  ui_item "4" "设置 / 修改入站 TLS 证书路径" "" "$C_GREEN"
+  echo "" >&2
   local op
   op="$(ask "请选择操作 (1-4)" "1")"
 
@@ -1300,13 +1379,14 @@ edit_existing_inbounds_interactive() {
 configure_manual_outbound() {
   local tag="${1:-proxy}"
   echo "" >&2
-  echo "--- 手动选择出站协议 ---" >&2
-  echo "  1) VLESS (支持 VLESS Encryption / REALITY / TLS)" >&2
-  echo "  2) VMess" >&2
-  echo "  3) Trojan" >&2
-  echo "  4) Shadowsocks" >&2
-  echo "  5) SOCKS5 上游代理" >&2
-  echo "  6) HTTP 上游代理" >&2
+  ui_section "手动选择出站协议"
+  ui_item "1" "VLESS" "支持 VLESS Encryption / REALITY / TLS"
+  ui_item "2" "VMess"
+  ui_item "3" "Trojan"
+  ui_item "4" "Shadowsocks"
+  ui_item "5" "SOCKS5" "上游代理"
+  ui_item "6" "HTTP" "上游代理"
+  echo "" >&2
 
   local choice
   choice="$(ask "请选择出站协议 (1-6)" "1")"
@@ -1506,10 +1586,11 @@ configure_manual_outbound() {
 build_single_outbound_interactive() {
   local default_tag="${1:-proxy}"
   echo "" >&2
-  echo "=== 选择出站方式 ===" >&2
-  echo "  1) 直连 (freedom)" >&2
-  echo "  2) 从协议分享链接解析 (vless / vmess / trojan / ss / socks5 / http)" >&2
-  echo "  3) 手动配置代理协议出站" >&2
+  ui_section "选择出站方式"
+  ui_item "1" "直连 (freedom)" "直接发出流量" "$C_GREEN"
+  ui_item "2" "协议分享链接解析" "vless / vmess / trojan / ss / socks5 / http"
+  ui_item "3" "手动配置代理协议出站" "逐步输入服务器与传输参数"
+  echo "" >&2
 
   local choice
   choice="$(ask "请选择出站方式 (1-3)" "2")"
@@ -1600,12 +1681,14 @@ set_primary_outbound() {
 edit_existing_outbounds_interactive() {
   echo "" >&2
   show_outbounds_summary "$OUTBOUNDS_JSON"
-  echo "出站修改方式：" >&2
-  echo "  1) 仅替换第 1 条主出站 (保留其余出站与 tag 结构)" >&2
-  echo "  2) 重新配置全部出站 (重置为 主出站 + direct + block)" >&2
-  echo "  3) 追加一条新出站" >&2
-  echo "  4) 删除指定序号的出站" >&2
-  echo "  5) 切换指定序号出站为默认主出站 (置顶到第 1 条)" >&2
+  echo "" >&2
+  ui_section "出站修改方式"
+  ui_item "1" "仅替换第 1 条主出站" "保留其余出站与 tag 结构"
+  ui_item "2" "重新配置全部出站" "重置为 主出站 + direct + block" "$C_YELLOW"
+  ui_item "3" "追加一条新出站" "保留现有出站"
+  ui_item "4" "删除指定序号的出站" "" "$C_RED"
+  ui_item "5" "切换默认主出站" "将指定序号出站置顶到第 1 条" "$C_GREEN"
+  echo "" >&2
   local op
   op="$(ask "请选择操作 (1-5)" "1")"
 
@@ -1759,8 +1842,6 @@ save_config() {
       owner="$(stat -c '%u:%g' "$output" 2>/dev/null || stat -f '%u:%g' "$output" 2>/dev/null || true)"
       [[ -n "$owner" ]] && chown "$owner" "$tmp_file" 2>/dev/null || true
     fi
-    cp -p "$output" "${output}.bak" 2>/dev/null || cp "$output" "${output}.bak"
-    echo "已自动备份原配置至：${output}.bak"
   else
     chmod 644 "$tmp_file"
   fi
@@ -2008,7 +2089,7 @@ main() {
       has_existing="true"
     elif (( load_rc == 2 )); then
       echo "错误：${config_file} 已存在但不是合法的 JSON 对象（可能含注释的 JSONC 或格式损坏）。" >&2
-      echo "请先修复/移除注释，或使用 --fresh 强制重新生成（原文件会自动备份为 .bak）。" >&2
+      echo "请先修复/移除注释，或使用 --fresh 强制重新生成（会覆盖原文件）。" >&2
       exit 1
     fi
   fi
@@ -2115,14 +2196,17 @@ main() {
     local orig_inbounds="$INBOUNDS_JSON"
     local orig_outbounds="$OUTBOUNDS_JSON"
     show_config_summary "$config_file"
-    echo "请选择要执行的操作：" >&2
-    echo "  1) 只修改入站 (覆盖/追加/删除/TLS路径)" >&2
-    echo "  2) 只修改出站 (保留当前入站及其他配置)" >&2
-    echo "  3) 只设置/修改入站 TLS 证书路径" >&2
-    echo "  4) 同时修改入站和出站 (保留 log/routing/dns 等其他字段)" >&2
-    echo "  5) 全新生成配置 (忽略原文件内容)" >&2
-    echo "  6) 更新脚本" >&2
-    echo "  7) 退出" >&2
+    echo "" >&2
+    ui_section "主菜单" "请选择要执行的操作"
+    ui_item "1" "只修改入站" "覆盖 / 追加 / 删除 / TLS 路径"
+    ui_item "2" "只修改出站" "替换 / 重置 / 追加 / 删除 / 切换主出站"
+    ui_item "3" "设置入站 TLS 证书路径" "快捷修改 certificateFile 与 keyFile" "$C_GREEN"
+    ui_item "4" "同时修改入站和出站" "保留 log / routing / dns 等其他字段"
+    ui_item "5" "全新生成配置" "忽略原文件内容，重新引导生成" "$C_YELLOW"
+    ui_hr
+    ui_item "6" "更新脚本" "检查并更新 xray_gen.sh 到最新版本" "$C_GREEN"
+    ui_item "7" "退出" "不修改配置直接退出" "$C_DIM"
+    echo "" >&2
 
     local action
     action="$(ask "请选择 (1-7)" "3")"
