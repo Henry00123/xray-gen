@@ -5,6 +5,7 @@
 # 2. 支持只修改入站、只修改出站、只设置/修改入站 TLS 证书路径，保留原有 routing/dns/log 等配置
 # 3. 支持入站：SOCKS5、HTTP、SOCKS5+HTTP、VLESS、Shadowsocks、Dokodemo-door
 # 4. 支持出站：直连 (freedom)、手动配置协议、从分享链接解析 (vless/vmess/trojan/ss/socks5/http)
+# 5. 支持脚本自更新 (-u/--update 或交互式菜单)，支持自定义更新地址与镜像源
 
 set -euo pipefail
 
@@ -1598,6 +1599,115 @@ validate_with_xray() {
   fi
 }
 
+# ==================== 脚本自更新 ====================
+
+DEFAULT_UPDATE_URL="https://raw.githubusercontent.com/Henry00123/xray-gen/main/xray_gen.sh"
+
+resolve_script_path() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  [[ -n "$src" ]] || return 1
+  while [[ -L "$src" ]]; do
+    local dir target
+    dir="$(cd -P "$(dirname "$src")" && pwd)" || return 1
+    target="$(readlink "$src")" || return 1
+    [[ "$target" != /* ]] && target="${dir}/${target}"
+    src="$target"
+  done
+  local dir
+  dir="$(cd -P "$(dirname "$src")" && pwd)" || return 1
+  printf '%s/%s' "$dir" "$(basename "$src")"
+}
+
+files_identical() {
+  if command -v cmp >/dev/null 2>&1; then
+    cmp -s "$1" "$2"
+  elif command -v diff >/dev/null 2>&1; then
+    diff -q "$1" "$2" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+download_to_file() {
+  local url="$1"
+  local dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 15 --max-time 60 -o "$dest" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=15 -O "$dest" "$url"
+  else
+    echo "错误：未找到 curl 或 wget，无法下载更新。" >&2
+    return 1
+  fi
+}
+
+self_update() {
+  local url="${1:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
+  if [[ -z "$url" ]]; then
+    echo "错误：更新地址不能为空。" >&2
+    return 1
+  fi
+
+  local target_path
+  if ! target_path="$(resolve_script_path)" || [[ ! -f "$target_path" ]]; then
+    echo "错误：无法定位当前脚本文件，请以本地文件方式运行后再执行更新。" >&2
+    return 1
+  fi
+
+  local target_dir tmp_file
+  target_dir="$(dirname "$target_path")"
+  if ! tmp_file="$(mktemp "${target_dir}/.xray_gen.sh.tmp.XXXXXX" 2>/dev/null)"; then
+    echo "错误：无法在 ${target_dir} 创建临时文件，请检查目录写权限（如需要请使用 sudo）。" >&2
+    return 1
+  fi
+
+  echo "正在检查脚本更新: ${url}"
+  if ! download_to_file "$url" "$tmp_file"; then
+    rm -f "$tmp_file"
+    echo "错误：下载更新失败，请检查网络连接或使用 --update-url / XRAY_GEN_UPDATE_URL 指定镜像地址。" >&2
+    return 1
+  fi
+
+  local first_line=""
+  IFS= read -r first_line < "$tmp_file" || true
+  if [[ ! -s "$tmp_file" || "$first_line" != "#!/usr/bin/env bash" ]]; then
+    rm -f "$tmp_file"
+    echo "错误：下载的内容不是有效的 xray_gen.sh 脚本（文件头校验失败）。" >&2
+    return 1
+  fi
+
+  if ! bash -n "$tmp_file"; then
+    rm -f "$tmp_file"
+    echo "错误：下载的脚本未通过 bash -n 语法校验，已取消更新。" >&2
+    return 1
+  fi
+
+  if files_identical "$target_path" "$tmp_file"; then
+    rm -f "$tmp_file"
+    echo "当前脚本已是最新版本，无需更新。"
+    return 0
+  fi
+
+  if ! chmod --reference="$target_path" "$tmp_file" 2>/dev/null; then
+    local mode=""
+    mode="$(stat -c '%a' "$target_path" 2>/dev/null || stat -f '%Lp' "$target_path" 2>/dev/null || true)"
+    if [[ -n "$mode" ]]; then
+      chmod "$mode" "$tmp_file" 2>/dev/null || chmod 755 "$tmp_file"
+    else
+      chmod 755 "$tmp_file"
+    fi
+  fi
+  chmod +x "$tmp_file" 2>/dev/null || true
+
+  if ! mv -f "$tmp_file" "$target_path"; then
+    rm -f "$tmp_file"
+    echo "错误：替换脚本失败，请检查文件写权限。" >&2
+    return 1
+  fi
+
+  echo "脚本已更新：${target_path}"
+}
+
 # ==================== 主流程与命令行参数 ====================
 
 usage() {
@@ -1620,6 +1730,8 @@ usage() {
       --direct              快捷模式将主出站切换为直连（单独传入时仅修改出站）
       --link <uri>          快捷模式从分享链接解析主出站（单独传入时仅修改出站）
       --fresh               忽略现有 config.json，强制生成全新配置
+  -u, --update              检查并更新当前脚本到最新版本后退出
+      --update-url <url>    指定更新脚本的下载地址 (也可通过环境变量 XRAY_GEN_UPDATE_URL 指定)
   -h, --help                显示帮助信息
 EOF
 }
@@ -1632,11 +1744,11 @@ require_arg() {
 }
 
 main() {
-  check_deps
-
   local config_file="./config.json"
   local show_only="false"
   local fresh_mode="false"
+  local do_update="false"
+  local update_url=""
   local in_proto=""
   local listen="127.0.0.1"
   local port="10808"
@@ -1654,6 +1766,8 @@ main() {
       -c|-o|--output) require_arg "$1" "${2:-}"; config_file="$2"; shift 2 ;;
       -s|--show)      show_only="true"; shift ;;
       --fresh)        fresh_mode="true"; shift ;;
+      -u|--update)    do_update="true"; shift ;;
+      --update-url)   require_arg "$1" "${2:-}"; update_url="$2"; shift 2 ;;
       --in-proto)     require_arg "$1" "${2:-}"; in_proto="$2"; has_in_args="true"; shift 2 ;;
       --listen)       require_arg "$1" "${2:-}"; listen="$2"; has_in_args="true"; shift 2 ;;
       --port)         require_arg "$1" "${2:-}"; port="$2"; has_in_args="true"; shift 2 ;;
@@ -1670,6 +1784,13 @@ main() {
         ;;
     esac
   done
+
+  if [[ "$do_update" == "true" ]]; then
+    self_update "$update_url"
+    exit 0
+  fi
+
+  check_deps
 
   local has_existing="false"
   if [[ "$fresh_mode" == "false" ]] && load_existing_config "$config_file"; then
@@ -1766,10 +1887,11 @@ main() {
     echo "  3) 只设置/修改入站 TLS 证书路径" >&2
     echo "  4) 同时修改入站和出站 (保留 log/routing/dns 等其他字段)" >&2
     echo "  5) 全新生成配置 (忽略原文件内容)" >&2
-    echo "  6) 退出" >&2
+    echo "  6) 更新脚本" >&2
+    echo "  7) 退出" >&2
 
     local action
-    action="$(ask "请选择 (1-6)" "3")"
+    action="$(ask "请选择 (1-7)" "3")"
     case "$action" in
       1)
         edit_existing_inbounds_interactive
@@ -1790,6 +1912,12 @@ main() {
         configure_full_outbounds_interactive
         ;;
       6)
+        local target_url="${update_url:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
+        target_url="$(ask "更新脚本 URL (回车使用默认地址)" "$target_url")"
+        self_update "$target_url"
+        exit 0
+        ;;
+      7)
         echo "已退出，未修改配置。"
         exit 0
         ;;
