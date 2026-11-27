@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Xray-core 配置生成与修改脚本 (Bash + jq)
 # 功能：
-# 1. 自动读取当前目录 ./config.json（或 -c/-o 指定文件），解析并展示当前入站/出站及 TLS 证书路径
+# 1. 默认读取 /usr/local/etc/xray/config.json（与官方 Xray 安装路径一致，支持 -c/-o 指定），解析并展示当前入站/出站及 TLS 证书路径
 # 2. 支持只修改入站、只修改出站、只设置/修改入站 TLS 证书路径，保留原有 routing/dns/log 等配置
 # 3. 支持入站：SOCKS5、HTTP、SOCKS5+HTTP、VLESS、Shadowsocks、Dokodemo-door
 # 4. 支持出站：直连 (freedom)、手动配置协议、从分享链接解析 (vless/vmess/trojan/ss/socks5/http)
@@ -12,18 +12,80 @@ set -euo pipefail
 
 # ==================== 环境与依赖检查 ====================
 
+XRAY_CONF_DIR="${JSON_PATH:-/usr/local/etc/xray}"
+XRAY_DEFAULT_CONFIG="${XRAY_CONFIG_PATH:-${XRAY_CONF_DIR}/config.json}"
+
+run_privileged() {
+  if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "错误：该操作需要 root 权限，请切换为 root 或安装 sudo 后重试。" >&2
+    return 1
+  fi
+}
+
+install_system_packages() {
+  local -a pkgs=("$@")
+  (( ${#pkgs[@]} == 0 )) && return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    run_privileged apt-get update && run_privileged apt-get install -y "${pkgs[@]}"
+  elif command -v dnf >/dev/null 2>&1; then
+    run_privileged dnf install -y "${pkgs[@]}"
+  elif command -v yum >/dev/null 2>&1; then
+    run_privileged yum install -y "${pkgs[@]}"
+  elif command -v apk >/dev/null 2>&1; then
+    run_privileged apk add --no-cache "${pkgs[@]}"
+  elif command -v pacman >/dev/null 2>&1; then
+    run_privileged pacman -Sy --noconfirm "${pkgs[@]}"
+  elif command -v brew >/dev/null 2>&1; then
+    brew install "${pkgs[@]}"
+  else
+    echo "错误：未识别到受支持的包管理器，请手动安装：${pkgs[*]}" >&2
+    return 1
+  fi
+}
+
 check_deps() {
+  local interactive="${1:-false}"
   if ! command -v jq >/dev/null 2>&1; then
-    echo "错误：未找到 jq，请先安装后再运行。" >&2
-    echo "  Debian/Ubuntu: sudo apt update && sudo apt install -y jq" >&2
-    echo "  CentOS/RHEL:   sudo yum install -y jq" >&2
-    echo "  Alpine:        apk add jq" >&2
-    echo "  macOS:         brew install jq" >&2
-    exit 1
+    if [[ "$interactive" == "true" && -t 0 ]]; then
+      echo "提示：未检测到 jq（配置解析与生成需要 jq）。" >&2
+      if ask_yes_no "是否现在自动安装 jq" "y"; then
+        if install_system_packages jq && command -v jq >/dev/null 2>&1; then
+          echo "jq 安装成功。" >&2
+        else
+          echo "错误：自动安装 jq 失败，请手动安装后再试。" >&2
+          return 1
+        fi
+      else
+        return 1
+      fi
+    else
+      echo "错误：未找到 jq，请先安装后再运行。" >&2
+      echo "  Debian/Ubuntu: sudo apt update && sudo apt install -y jq" >&2
+      echo "  CentOS/RHEL:   sudo yum install -y jq" >&2
+      echo "  Alpine:        apk add jq" >&2
+      echo "  macOS:         brew install jq" >&2
+      return 1
+    fi
   fi
   if ! command -v base64 >/dev/null 2>&1; then
     echo "错误：未找到 base64 命令。" >&2
-    exit 1
+    return 1
+  fi
+}
+
+ensure_xray_install_deps() {
+  local -a missing=()
+  command -v curl >/dev/null 2>&1 || missing+=("curl")
+  command -v unzip >/dev/null 2>&1 || missing+=("unzip")
+  (( ${#missing[@]} == 0 )) && return 0
+
+  echo "提示：官方 install-release.sh 需要依赖：${missing[*]}（当前未安装）。" >&2
+  if [[ -t 0 ]] && ask_yes_no "是否现在自动安装缺失依赖 (${missing[*]})" "y"; then
+    install_system_packages "${missing[@]}" || true
   fi
 }
 
@@ -180,6 +242,34 @@ gen_uuid() {
     $(( ($RANDOM & 0x3fff) | 0x8000 )) $RANDOM $RANDOM $RANDOM
 }
 
+gen_ss2022_key() {
+  local method="${1:-2022-blake3-aes-128-gcm}"
+  local bytes=16
+  case "$method" in
+    *256*|*chacha20*) bytes=32 ;;
+  esac
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 "$bytes" 2>/dev/null && return 0
+  fi
+  if [[ -r /dev/urandom ]]; then
+    head -c "$bytes" /dev/urandom | base64 | tr -d '\r\n'
+    printf '\n'
+    return 0
+  fi
+  return 1
+}
+
+gen_reality_keypair() {
+  REALITY_GEN_PRIV=""
+  REALITY_GEN_PUB=""
+  command -v xray >/dev/null 2>&1 || return 1
+  local out
+  out="$(xray x25519 2>/dev/null || true)"
+  REALITY_GEN_PRIV="$(printf '%s\n' "$out" | awk -F': *' '/^Private ?[Kk]ey:/ {print $2; exit}')"
+  REALITY_GEN_PUB="$(printf '%s\n' "$out" | awk -F': *' '/^(Password|Public ?[Kk]ey):/ {print $2; exit}')"
+  [[ -n "$REALITY_GEN_PRIV" ]]
+}
+
 url_decode() {
   local s="$1"
   local out=""
@@ -274,7 +364,7 @@ BASE_CONFIG_JSON=""
 INBOUNDS_JSON="[]"
 OUTBOUNDS_JSON="[]"
 
-# 返回值: 0=加载成功, 1=文件不存在, 2=文件存在但无法解析为合法 JSON 对象
+# 返回值: 0=加载成功, 1=文件不存在或为空文件, 2=无法读取或不是合法 JSON 对象
 load_existing_config() {
   local file="$1"
   BASE_CONFIG_JSON=""
@@ -282,6 +372,13 @@ load_existing_config() {
   OUTBOUNDS_JSON="[]"
 
   if [[ ! -f "$file" ]]; then
+    return 1
+  fi
+  if [[ ! -r "$file" ]]; then
+    echo "错误：无权限读取 ${file}，请使用 root/sudo 运行或检查文件权限。" >&2
+    return 2
+  fi
+  if [[ ! -s "$file" ]] || [[ -z "$(tr -d '[:space:]' < "$file")" ]]; then
     return 1
   fi
   if ! jq -e 'type == "object"' "$file" >/dev/null 2>&1; then
@@ -478,8 +575,8 @@ configure_tls_cert_paths_interactive() {
   cur_cert="$(printf '%s' "$INBOUNDS_JSON" | jq -r --argjson i "$zero_idx" '.[$i].streamSettings.tlsSettings.certificates[0].certificateFile // ""')"
   cur_key="$(printf '%s' "$INBOUNDS_JSON" | jq -r --argjson i "$zero_idx" '.[$i].streamSettings.tlsSettings.certificates[0].keyFile // ""')"
 
-  local default_cert="${cur_cert:-/etc/xray/fullchain.pem}"
-  local default_key="${cur_key:-/etc/xray/privkey.pem}"
+  local default_cert="${cur_cert:-${XRAY_CONF_DIR}/fullchain.pem}"
+  local default_key="${cur_key:-${XRAY_CONF_DIR}/privkey.pem}"
 
   local cert key
   cert="$(ask "TLS 证书文件路径 (certificateFile)" "$default_cert")"
@@ -1203,14 +1300,26 @@ build_inbounds_interactive() {
     esac
 
     if [[ "$security" == "tls" ]]; then
-      cert="$(ask "TLS 证书文件路径 (certificateFile)" "/etc/xray/fullchain.pem")"
-      key="$(ask "TLS 私钥文件路径 (keyFile)" "/etc/xray/privkey.pem")"
+      cert="$(ask "TLS 证书文件路径 (certificateFile)" "${XRAY_CONF_DIR}/fullchain.pem")"
+      key="$(ask "TLS 私钥文件路径 (keyFile)" "${XRAY_CONF_DIR}/privkey.pem")"
       [[ ! -f "$cert" ]] && echo "提示：本地未检测到证书文件（仍会写入配置）: ${cert}" >&2
       [[ ! -f "$key" ]] && echo "提示：本地未检测到私钥文件（仍会写入配置）: ${key}" >&2
     elif [[ "$security" == "reality" ]]; then
       target="$(ask "REALITY 回落目标 target/dest" "www.microsoft.com:443")"
       snis="$(ask "REALITY serverNames (逗号分隔)" "${target%%:*}")"
-      priv_key="$(ask "REALITY privateKey (xray x25519 生成)" "")"
+      local default_priv=""
+      if gen_reality_keypair; then
+        default_priv="$REALITY_GEN_PRIV"
+      fi
+      if [[ -n "$default_priv" ]]; then
+        priv_key="$(ask_required "REALITY privateKey (回车使用自动生成)" "$default_priv")"
+        if [[ "$priv_key" == "$default_priv" && -n "$REALITY_GEN_PUB" ]]; then
+          printf '%s提示：已自动生成 REALITY 密钥对，客户端公钥 (pbk/Password):%s %s%s%s\n' \
+            "$C_GREEN" "$C_RESET" "$C_BOLD" "$REALITY_GEN_PUB" "$C_RESET" >&2
+        fi
+      else
+        priv_key="$(ask_required "REALITY privateKey (可运行 xray x25519 生成)")"
+      fi
       sids="$(ask "REALITY shortIds (逗号分隔，可留空)" "")"
     fi
 
@@ -1267,12 +1376,17 @@ build_inbounds_interactive() {
     result="$(printf '%s' "$result" | jq --argjson i "$item" '. + [$i]')"
 
   elif [[ "$choice" == "5" ]]; then
-    local tag listen port method pwd
+    local tag listen port method default_pwd pwd
     tag="$(ask "Shadowsocks 入站 tag" "ss-in")"
     listen="$(ask "Shadowsocks 监听地址" "0.0.0.0")"
     port="$(ask_port "Shadowsocks 监听端口" "8388")"
     method="$(ask "加密方式" "2022-blake3-aes-128-gcm")"
-    pwd="$(ask "密码 (2022 协议需 Base64 密钥)" "change-me")"
+    default_pwd="$(gen_ss2022_key "$method" || true)"
+    if [[ -n "$default_pwd" ]]; then
+      pwd="$(ask_required "密码 (回车使用自动生成的 Base64 密钥)" "$default_pwd")"
+    else
+      pwd="$(ask_required "密码 (2022 协议需 Base64 密钥)")"
+    fi
     local item
     item="$(jq -n \
       --arg tag "$tag" \
@@ -1800,10 +1914,29 @@ update_inbound_endpoint() {
   echo "已更新第 ${idx} 条入站的监听设置。" >&2
 }
 
+LAST_SAVE_WRITTEN="false"
+
+dir_requires_privilege() {
+  local dir="$1"
+  local file="${2:-}"
+  if [[ -d "$dir" ]]; then
+    if [[ ! -w "$dir" ]] || { [[ -n "$file" && -e "$file" && ! -w "$file" ]]; }; then
+      return 0
+    fi
+    return 1
+  fi
+  local parent="$dir"
+  while [[ ! -d "$parent" && "$parent" != "/" && "$parent" != "." ]]; do
+    parent="$(dirname "$parent")"
+  done
+  [[ ! -w "$parent" ]]
+}
+
 save_config() {
   local output="$1"
   local allow_force="${2:-false}"
   local final_json
+  LAST_SAVE_WRITTEN="false"
 
   if [[ -n "$BASE_CONFIG_JSON" ]]; then
     final_json="$(printf '%s' "$BASE_CONFIG_JSON" | jq \
@@ -1822,14 +1955,24 @@ save_config() {
     ')"
   fi
 
-  if [[ -f "$output" ]] && jq -e --argjson new "$final_json" '. == $new' "$output" >/dev/null 2>&1; then
+  if [[ -f "$output" && -r "$output" ]] && jq -e --argjson new "$final_json" '. == $new' "$output" >/dev/null 2>&1; then
     echo "配置内容未发生变化，跳过写入。"
     return 0
   fi
 
-  local output_dir tmp_file
+  local output_dir tmp_file need_priv="false"
   output_dir="$(dirname "$output")"
-  tmp_file="$(mktemp "${output_dir}/.xray_config.tmp.XXXXXX.json" 2>/dev/null || mktemp "${output_dir}/.xray_config.tmp.XXXXXX")"
+  if dir_requires_privilege "$output_dir" "$output"; then
+    need_priv="true"
+  fi
+
+  if [[ "$need_priv" == "false" ]]; then
+    [[ ! -d "$output_dir" ]] && mkdir -p "$output_dir"
+    tmp_file="$(mktemp "${output_dir}/.xray_config.tmp.XXXXXX.json" 2>/dev/null || mktemp "${output_dir}/.xray_config.tmp.XXXXXX")"
+  else
+    tmp_file="$(mktemp "${TMPDIR:-/tmp}/.xray_config.tmp.XXXXXX.json" 2>/dev/null || mktemp)"
+  fi
+
   if ! printf '%s\n' "$final_json" > "$tmp_file"; then
     rm -f "$tmp_file"
     return 1
@@ -1840,22 +1983,45 @@ save_config() {
     return 1
   fi
 
-  if [[ -f "$output" ]]; then
-    copy_file_mode "$output" "$tmp_file" "644"
-    if ! chown --reference="$output" "$tmp_file" 2>/dev/null; then
-      local owner=""
-      owner="$(stat -c '%u:%g' "$output" 2>/dev/null || stat -f '%u:%g' "$output" 2>/dev/null || true)"
-      [[ -n "$owner" ]] && chown "$owner" "$tmp_file" 2>/dev/null || true
+  if [[ "$need_priv" == "true" ]]; then
+    if ! run_privileged mkdir -p "$output_dir"; then
+      rm -f "$tmp_file"
+      return 1
+    fi
+    if [[ -f "$output" ]]; then
+      local orig_mode="" orig_owner=""
+      orig_mode="$(stat -c '%a' "$output" 2>/dev/null || stat -f '%Lp' "$output" 2>/dev/null || true)"
+      orig_owner="$(stat -c '%u:%g' "$output" 2>/dev/null || stat -f '%u:%g' "$output" 2>/dev/null || true)"
+      run_privileged chmod "${orig_mode:-644}" "$tmp_file" 2>/dev/null || run_privileged chmod 644 "$tmp_file"
+      [[ -n "$orig_owner" ]] && run_privileged chown "$orig_owner" "$tmp_file" 2>/dev/null || true
+    else
+      run_privileged chmod 644 "$tmp_file"
+    fi
+    if ! run_privileged mv -f "$tmp_file" "$output"; then
+      rm -f "$tmp_file"
+      echo "错误：写入配置文件失败：${output}" >&2
+      return 1
     fi
   else
-    chmod 644 "$tmp_file"
+    if [[ -f "$output" ]]; then
+      copy_file_mode "$output" "$tmp_file" "644"
+      if ! chown --reference="$output" "$tmp_file" 2>/dev/null; then
+        local owner=""
+        owner="$(stat -c '%u:%g' "$output" 2>/dev/null || stat -f '%u:%g' "$output" 2>/dev/null || true)"
+        [[ -n "$owner" ]] && chown "$owner" "$tmp_file" 2>/dev/null || true
+      fi
+    else
+      chmod 644 "$tmp_file"
+    fi
+
+    if ! mv -f "$tmp_file" "$output"; then
+      rm -f "$tmp_file"
+      echo "错误：写入配置文件失败：${output}" >&2
+      return 1
+    fi
   fi
 
-  if ! mv -f "$tmp_file" "$output"; then
-    rm -f "$tmp_file"
-    echo "错误：写入配置文件失败：${output}" >&2
-    return 1
-  fi
+  LAST_SAVE_WRITTEN="true"
   echo "已成功写入配置：${output}"
 
   if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
@@ -1920,21 +2086,35 @@ files_identical() {
   fi
 }
 
+wget_download() {
+  local url="$1"
+  local dest="$2"
+  local timeout="${3:-30}"
+  if wget --help 2>&1 | grep -q -- '--no-cache'; then
+    wget -q --no-cache --timeout="$timeout" -O "$dest" "$url"
+  else
+    wget -q -T "$timeout" -O "$dest" "$url"
+  fi
+}
+
 download_to_file() {
   local url="$1"
   local dest="$2"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL -H "Cache-Control: no-cache" --connect-timeout 15 --max-time 60 -o "$dest" "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --no-cache --timeout=15 -O "$dest" "$url"
+    wget_download "$url" "$dest" 15
   else
     echo "错误：未找到 curl 或 wget，无法下载更新。" >&2
     return 1
   fi
 }
 
+SELF_UPDATED="false"
+
 self_update() {
   local url="${1:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
+  SELF_UPDATED="false"
   if [[ -z "$url" ]]; then
     echo "错误：更新地址不能为空。" >&2
     return 1
@@ -1946,11 +2126,16 @@ self_update() {
     return 1
   fi
 
-  local target_dir tmp_file
+  local target_dir tmp_file need_priv="false"
   target_dir="$(dirname "$target_path")"
-  if ! tmp_file="$(mktemp "${target_dir}/.xray_gen.sh.tmp.XXXXXX" 2>/dev/null)"; then
-    echo "错误：无法在 ${target_dir} 创建临时文件，请检查目录写权限（如需要请使用 sudo）。" >&2
-    return 1
+  if dir_requires_privilege "$target_dir" "$target_path"; then
+    need_priv="true"
+    tmp_file="$(mktemp "${TMPDIR:-/tmp}/.xray_gen.sh.tmp.XXXXXX" 2>/dev/null || mktemp)"
+  else
+    if ! tmp_file="$(mktemp "${target_dir}/.xray_gen.sh.tmp.XXXXXX" 2>/dev/null)"; then
+      echo "错误：无法在 ${target_dir} 创建临时文件，请检查目录写权限。" >&2
+      return 1
+    fi
   fi
 
   echo "正在检查脚本更新: ${url}"
@@ -1980,32 +2165,33 @@ self_update() {
     return 0
   fi
 
-  copy_file_mode "$target_path" "$tmp_file" "755"
-  chmod +x "$tmp_file" 2>/dev/null || true
-
-  if ! mv -f "$tmp_file" "$target_path"; then
-    rm -f "$tmp_file"
-    echo "错误：替换脚本失败，请检查文件写权限。" >&2
-    return 1
+  if [[ "$need_priv" == "true" ]]; then
+    local orig_mode=""
+    orig_mode="$(stat -c '%a' "$target_path" 2>/dev/null || stat -f '%Lp' "$target_path" 2>/dev/null || true)"
+    run_privileged chmod "${orig_mode:-755}" "$tmp_file" 2>/dev/null || run_privileged chmod 755 "$tmp_file"
+    run_privileged chmod +x "$tmp_file" 2>/dev/null || true
+    if ! run_privileged mv -f "$tmp_file" "$target_path"; then
+      rm -f "$tmp_file"
+      echo "错误：替换脚本失败，请检查文件写权限。" >&2
+      return 1
+    fi
+  else
+    copy_file_mode "$target_path" "$tmp_file" "755"
+    chmod +x "$tmp_file" 2>/dev/null || true
+    if ! mv -f "$tmp_file" "$target_path"; then
+      rm -f "$tmp_file"
+      echo "错误：替换脚本失败，请检查文件写权限。" >&2
+      return 1
+    fi
   fi
 
+  SELF_UPDATED="true"
   echo "脚本已更新：${target_path}"
 }
 
 # ==================== Xray 安装与状态监测 ====================
 
 XRAY_INSTALL_URL="${XRAY_INSTALL_URL:-https://github.com/XTLS/Xray-install/raw/main/install-release.sh}"
-
-run_privileged() {
-  if [[ "$(id -u 2>/dev/null || echo 1)" -eq 0 ]]; then
-    "$@"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
-  else
-    echo "错误：该操作需要 root 权限，请切换为 root 或安装 sudo 后重试。" >&2
-    return 1
-  fi
-}
 
 download_xray_installer() {
   local url="$1"
@@ -2017,7 +2203,7 @@ download_xray_installer() {
     fi
   fi
   if command -v wget >/dev/null 2>&1; then
-    wget -q --no-cache --timeout=30 -O "$dest" "$url"
+    wget_download "$url" "$dest" 30
   elif command -v curl >/dev/null 2>&1; then
     curl -fsSL -H "Cache-Control: no-cache" --connect-timeout 15 --max-time 120 -o "$dest" "$url"
   else
@@ -2081,6 +2267,10 @@ get_xray_brief_status() {
 install_xray() {
   local action="${1:-install}"
   shift || true
+
+  if [[ "$action" == "install" ]]; then
+    ensure_xray_install_deps
+  fi
 
   local tmp_script
   tmp_script="$(mktemp)"
@@ -2190,8 +2380,28 @@ control_xray_service() {
   fi
 }
 
+prompt_restart_xray_after_save() {
+  [[ "$LAST_SAVE_WRITTEN" == "true" ]] || return 0
+  [[ -t 0 ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl cat xray >/dev/null 2>&1 || return 0
+
+  local active=""
+  active="$(systemctl is-active xray 2>/dev/null || true)"
+  echo "" >&2
+  if [[ "$active" == "active" ]]; then
+    if ask_yes_no "配置已写入，是否立即重启 xray 服务使配置生效" "y"; then
+      control_xray_service restart || true
+    fi
+  else
+    if ask_yes_no "配置已写入，是否立即启动 xray 服务" "y"; then
+      control_xray_service start || true
+    fi
+  fi
+}
+
 show_xray_status() {
-  local cfg_path="${1:-./config.json}"
+  local cfg_path="${1:-$XRAY_DEFAULT_CONFIG}"
   ui_header "Xray 状态监测"
 
   ui_section "安装信息"
@@ -2203,7 +2413,7 @@ show_xray_status() {
     printf '  %s路径:%s %s\n' "$C_DIM" "$C_RESET" "$xray_bin" >&2
     printf '  %s版本:%s %s%s%s\n' "$C_DIM" "$C_RESET" "$C_BOLD" "${first_line:-unknown}" "$C_RESET" >&2
   else
-    printf '  %s未检测到 xray 可执行文件（可运行 ./xray_gen.sh --install-xray 安装）%s\n' "$C_YELLOW" "$C_RESET" >&2
+    printf '  %s未检测到 xray 可执行文件（可运行 %s --install-xray 安装）%s\n' "$C_YELLOW" "$(basename "$0")" "$C_RESET" >&2
   fi
 
   echo "" >&2
@@ -2287,7 +2497,7 @@ show_xray_status() {
 }
 
 monitor_xray_interactive() {
-  local cfg_path="${1:-./config.json}"
+  local cfg_path="${1:-$XRAY_DEFAULT_CONFIG}"
   while true; do
     show_xray_status "$cfg_path"
     echo "" >&2
@@ -2297,11 +2507,13 @@ monitor_xray_interactive() {
     ui_item "3" "重启 Xray" "systemctl restart xray" "$C_YELLOW"
     ui_item "4" "停止 Xray" "systemctl stop xray" "$C_RED"
     ui_item "5" "安装 / 更新 / 卸载 Xray" "执行官方 install-release.sh"
-    ui_item "0" "退出" "" "$C_DIM"
+    ui_item "0" "返回" "" "$C_DIM"
     echo "" >&2
 
-    local op
-    op="$(ask "请选择 (0-5)" "0")"
+    local op=""
+    if ! op="$(ask "请选择 (0-5)" "0")"; then
+      return 0
+    fi
     case "$op" in
       1) continue ;;
       2) control_xray_service start || true ;;
@@ -2317,15 +2529,17 @@ monitor_xray_interactive() {
 # ==================== 主流程与命令行参数 ====================
 
 usage() {
-  cat <<'EOF'
-用法: ./xray_gen.sh [选项]
+  local cmd_name
+  cmd_name="$(basename "$0")"
+  cat <<EOF
+用法: ${cmd_name} [选项]
 
-无参数运行时自动检查当前目录 ./config.json：
-  - 若存在：展示 Xray 状态概览及当前入站/出站摘要，进入主菜单
-  - 若不存在：展示 Xray 状态概览及简明主菜单（可新建配置、安装 Xray 或监测状态）
+无参数运行时默认管理 ${XRAY_DEFAULT_CONFIG}（与官方 Xray 安装路径一致，支持 -c/-o 指定）：
+  - 若存在有效配置：展示 Xray 状态概览及当前入站/出站摘要，进入主菜单
+  - 若不存在或为空文件：展示 Xray 状态概览及简明主菜单（可新建配置、安装 Xray 或监测状态）
 
 选项:
-  -c, -o, --output <file>   指定配置文件路径 (默认: ./config.json)
+  -c, -o, --output <file>   指定配置文件路径 (默认: ${XRAY_DEFAULT_CONFIG})
   -s, --show                读取并展示当前配置文件的入站与出站信息后退出
       --in-proto <proto>    快捷模式重建入站协议: socks 或 http（单独传入时仅修改入站）
       --listen <addr>       入站监听地址 (新建默认: 127.0.0.1；已有配置未传 --in-proto 时原地修改 --in-index 指定入站)
@@ -2358,7 +2572,7 @@ require_arg() {
 }
 
 main() {
-  local config_file="./config.json"
+  local config_file="$XRAY_DEFAULT_CONFIG"
   local show_only="false"
   local fresh_mode="false"
   local do_update="false"
@@ -2449,8 +2663,8 @@ main() {
     is_quick_mode="true"
   fi
 
-  if [[ "$show_only" == "true" || "$is_quick_mode" == "true" || ( "$fresh_mode" == "false" && -f "$config_file" ) ]]; then
-    check_deps
+  if [[ "$show_only" == "true" || "$is_quick_mode" == "true" ]]; then
+    check_deps "false" || exit 1
   fi
 
   if [[ "$has_port_arg" == "true" ]] && ! is_valid_port "$port"; then
@@ -2458,31 +2672,30 @@ main() {
     exit 1
   fi
 
-  local has_existing="false"
-  if [[ "$fresh_mode" == "false" && -f "$config_file" ]]; then
-    local load_rc=0
-    load_existing_config "$config_file" || load_rc=$?
-    if (( load_rc == 0 )); then
-      has_existing="true"
-    elif (( load_rc == 2 )); then
-      echo "错误：${config_file} 已存在但不是合法的 JSON 对象（可能含注释的 JSONC 或格式损坏）。" >&2
-      echo "请先修复/移除注释，或使用 --fresh 强制重新生成（会覆盖原文件）。" >&2
-      exit 1
+  # 仅查看模式与命令行快捷模式
+  if [[ "$show_only" == "true" || "$is_quick_mode" == "true" ]]; then
+    local has_existing="false"
+    if [[ "$fresh_mode" == "false" && -f "$config_file" ]]; then
+      local load_rc=0
+      load_existing_config "$config_file" || load_rc=$?
+      if (( load_rc == 0 )); then
+        has_existing="true"
+      elif (( load_rc == 2 )); then
+        echo "错误：${config_file} 已存在但不是合法的 JSON 对象（可能含注释的 JSONC 或格式损坏）。" >&2
+        echo "请先修复/移除注释，或使用 --fresh 强制重新生成（会覆盖原文件）。" >&2
+        exit 1
+      fi
     fi
-  fi
 
-  # 仅查看模式
-  if [[ "$show_only" == "true" ]]; then
-    if [[ "$has_existing" == "false" ]]; then
-      echo "错误：未找到配置文件 ${config_file}" >&2
-      exit 1
+    if [[ "$show_only" == "true" ]]; then
+      if [[ "$has_existing" == "false" ]]; then
+        echo "错误：未找到有效配置文件 ${config_file}" >&2
+        exit 1
+      fi
+      show_config_summary "$config_file"
+      exit 0
     fi
-    show_config_summary "$config_file"
-    exit 0
-  fi
 
-  # 命令行快捷模式（支持只改入站、只改监听/端口、只改 TLS 路径或只改出站）
-  if [[ "$is_quick_mode" == "true" ]]; then
     if [[ -n "$out_index" && "$has_out_args" == "true" ]]; then
       echo "错误：--out-index 不能与 --direct 或 --link 同时使用。" >&2
       exit 1
@@ -2568,125 +2781,171 @@ main() {
     exit 0
   fi
 
-  # 交互式模式
-  if [[ "$has_existing" == "true" ]]; then
-    local orig_inbounds="$INBOUNDS_JSON"
-    local orig_outbounds="$OUTBOUNDS_JSON"
-    show_config_summary "$config_file"
-    echo "" >&2
-    ui_section "主菜单" "请选择要执行的操作"
-    ui_item "1" "只修改入站" "覆盖 / 追加 / 删除 / TLS 路径"
-    ui_item "2" "只修改出站" "替换 / 重置 / 追加 / 删除 / 切换主出站"
-    ui_item "3" "设置入站 TLS 证书路径" "快捷修改 certificateFile 与 keyFile" "$C_GREEN"
-    ui_item "4" "同时修改入站和出站" "保留 log / routing / dns 等其他字段"
-    ui_item "5" "全新生成配置" "忽略原文件内容，重新引导生成" "$C_YELLOW"
-    ui_hr
-    ui_item "6" "Xray 状态监测与服务管理" "查看版本 / 状态 / 端口 / 日志 / 启停重启" "$C_CYAN"
-    ui_item "7" "安装 / 更新 / 卸载 Xray" "执行官方 install-release.sh" "$C_GREEN"
-    ui_item "8" "更新本脚本" "检查并更新 xray_gen.sh 到最新版本" "$C_GREEN"
-    ui_item "0" "退出" "不修改配置直接退出" "$C_DIM"
-    echo "" >&2
+  # 交互式模式（循环主菜单，支持一次会话完成安装、配置、启停与状态监测）
+  while true; do
+    local has_existing="false"
+    local has_jq="false"
+    command -v jq >/dev/null 2>&1 && has_jq="true"
 
-    local action
-    action="$(ask "请选择 (0-8)" "3")"
-    case "$action" in
-      1)
-        edit_existing_inbounds_interactive
-        ;;
-      2)
-        edit_existing_outbounds_interactive
-        ;;
-      3)
-        configure_tls_cert_paths_interactive
-        ;;
-      4)
-        edit_existing_inbounds_interactive
-        edit_existing_outbounds_interactive
-        ;;
-      5)
-        BASE_CONFIG_JSON=""
-        INBOUNDS_JSON="$(build_inbounds_interactive)"
-        configure_full_outbounds_interactive
-        ;;
-      6)
-        monitor_xray_interactive "$config_file"
-        exit 0
-        ;;
-      7)
-        manage_xray_install_interactive
-        exit 0
-        ;;
-      8)
-        local target_url="${update_url:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
-        target_url="$(ask "更新脚本 URL (回车使用默认地址)" "$target_url")"
-        self_update "$target_url"
-        exit 0
-        ;;
-      0)
-        echo "已退出，未修改配置。"
-        exit 0
-        ;;
-      *)
-        echo "无效选项。" >&2
-        exit 1
-        ;;
-    esac
-    if [[ "$action" != "5" && "$INBOUNDS_JSON" == "$orig_inbounds" && "$OUTBOUNDS_JSON" == "$orig_outbounds" ]]; then
-      echo "配置未发生变化，已退出。"
-      exit 0
+    if [[ "$fresh_mode" == "false" && -f "$config_file" && -s "$config_file" && -r "$config_file" ]]; then
+      if [[ -n "$(tr -d '[:space:]' < "$config_file")" ]]; then
+        if [[ "$has_jq" == "false" ]] && check_deps "true"; then
+          has_jq="true"
+        fi
+        if [[ "$has_jq" == "true" ]]; then
+          local load_rc=0
+          load_existing_config "$config_file" || load_rc=$?
+          if (( load_rc == 0 )); then
+            has_existing="true"
+          elif (( load_rc == 2 )); then
+            echo "错误：${config_file} 已存在但不是合法的 JSON 对象（可能含注释的 JSONC 或格式损坏）。" >&2
+            echo "请先修复/移除注释，或使用 --fresh 强制重新生成（会覆盖原文件）。" >&2
+            exit 1
+          fi
+        fi
+      fi
     fi
-    config_file="$(ask "保存配置文件路径" "$config_file")"
-  else
-    echo "" >&2
-    ui_hr
-    printf '  %s%s◆ Xray 配置与管理工具%s  %s(未检测到 %s)%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$config_file" "$C_RESET" >&2
-    printf '  %s● Xray 状态:%s %s\n' "$C_DIM" "$C_RESET" "$(get_xray_brief_status)" >&2
-    ui_hr
-    echo "" >&2
-    ui_section "主菜单" "请选择要执行的操作"
-    ui_item "1" "生成新配置" "引导创建 ${config_file}" "$C_GREEN"
-    ui_item "2" "Xray 状态监测与服务管理" "查看版本 / 状态 / 端口 / 日志 / 启停重启" "$C_CYAN"
-    ui_item "3" "安装 / 更新 / 卸载 Xray" "执行官方 install-release.sh" "$C_GREEN"
-    ui_item "4" "更新本脚本" "检查并更新 xray_gen.sh 到最新版本" "$C_GREEN"
-    ui_item "0" "退出" "" "$C_DIM"
-    echo "" >&2
 
-    local action
-    action="$(ask "请选择 (0-4)" "1")"
-    case "$action" in
-      1)
-        check_deps
-        INBOUNDS_JSON="$(build_inbounds_interactive)"
-        configure_full_outbounds_interactive
-        config_file="$(ask "输出文件路径" "$config_file")"
-        ;;
-      2)
-        monitor_xray_interactive "$config_file"
-        exit 0
-        ;;
-      3)
-        manage_xray_install_interactive
-        exit 0
-        ;;
-      4)
-        local target_url="${update_url:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
-        target_url="$(ask "更新脚本 URL (回车使用默认地址)" "$target_url")"
-        self_update "$target_url"
-        exit 0
-        ;;
-      0)
-        echo "已退出。"
-        exit 0
-        ;;
-      *)
-        echo "无效选项。" >&2
-        exit 1
-        ;;
-    esac
-  fi
+    if [[ "$has_existing" == "true" ]]; then
+      local orig_inbounds="$INBOUNDS_JSON"
+      local orig_outbounds="$OUTBOUNDS_JSON"
+      show_config_summary "$config_file"
+      echo "" >&2
+      ui_section "主菜单" "请选择要执行的操作"
+      ui_item "1" "只修改入站" "覆盖 / 追加 / 删除 / TLS 路径"
+      ui_item "2" "只修改出站" "替换 / 重置 / 追加 / 删除 / 切换主出站"
+      ui_item "3" "设置入站 TLS 证书路径" "快捷修改 certificateFile 与 keyFile" "$C_GREEN"
+      ui_item "4" "同时修改入站和出站" "保留 log / routing / dns 等其他字段"
+      ui_item "5" "全新生成配置" "忽略原文件内容，重新引导生成" "$C_YELLOW"
+      ui_hr
+      ui_item "6" "Xray 状态监测与服务管理" "查看版本 / 状态 / 端口 / 日志 / 启停重启" "$C_CYAN"
+      ui_item "7" "安装 / 更新 / 卸载 Xray" "执行官方 install-release.sh" "$C_GREEN"
+      ui_item "8" "更新本脚本" "检查并更新脚本到最新版本" "$C_GREEN"
+      ui_item "0" "退出" "不修改配置直接退出" "$C_DIM"
+      echo "" >&2
 
-  save_config "$config_file" "true"
-  show_config_summary "$config_file"
+      local action=""
+      if ! action="$(ask "请选择 (0-8)" "3")"; then
+        break
+      fi
+      case "$action" in
+        1)
+          edit_existing_inbounds_interactive || continue
+          ;;
+        2)
+          edit_existing_outbounds_interactive || continue
+          ;;
+        3)
+          configure_tls_cert_paths_interactive || continue
+          ;;
+        4)
+          edit_existing_inbounds_interactive || continue
+          edit_existing_outbounds_interactive || continue
+          ;;
+        5)
+          BASE_CONFIG_JSON=""
+          INBOUNDS_JSON="$(build_inbounds_interactive)"
+          configure_full_outbounds_interactive
+          ;;
+        6)
+          monitor_xray_interactive "$config_file"
+          continue
+          ;;
+        7)
+          manage_xray_install_interactive || true
+          continue
+          ;;
+        8)
+          local target_url="${update_url:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
+          target_url="$(ask "更新脚本 URL (回车使用默认地址)" "$target_url")"
+          if self_update "$target_url" && [[ "$SELF_UPDATED" == "true" ]]; then
+            echo "请重新运行脚本以使用新版本。"
+            exit 0
+          fi
+          continue
+          ;;
+        0)
+          echo "已退出。"
+          exit 0
+          ;;
+        *)
+          echo "无效选项。" >&2
+          continue
+          ;;
+      esac
+
+      if [[ "$action" != "5" && "$INBOUNDS_JSON" == "$orig_inbounds" && "$OUTBOUNDS_JSON" == "$orig_outbounds" ]]; then
+        echo "配置未发生变化。"
+        continue
+      fi
+      config_file="$(ask "保存配置文件路径" "$config_file")"
+      if save_config "$config_file" "true"; then
+        fresh_mode="false"
+        prompt_restart_xray_after_save
+      fi
+    else
+      local cfg_hint="未检测到 ${config_file}"
+      if [[ -f "$config_file" && ! -s "$config_file" ]]; then
+        cfg_hint="${config_file} 为空，尚未配置"
+      elif [[ -f "$config_file" && "$has_jq" == "false" ]]; then
+        cfg_hint="${config_file} 已存在（需安装 jq 后读取）"
+      fi
+      echo "" >&2
+      ui_hr
+      printf '  %s%s◆ Xray 配置与管理工具%s  %s(%s)%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$cfg_hint" "$C_RESET" >&2
+      printf '  %s● Xray 状态:%s %s\n' "$C_DIM" "$C_RESET" "$(get_xray_brief_status)" >&2
+      ui_hr
+      echo "" >&2
+      ui_section "主菜单" "请选择要执行的操作"
+      ui_item "1" "生成新配置" "引导创建 ${config_file}" "$C_GREEN"
+      ui_item "2" "Xray 状态监测与服务管理" "查看版本 / 状态 / 端口 / 日志 / 启停重启" "$C_CYAN"
+      ui_item "3" "安装 / 更新 / 卸载 Xray" "执行官方 install-release.sh" "$C_GREEN"
+      ui_item "4" "更新本脚本" "检查并更新脚本到最新版本" "$C_GREEN"
+      ui_item "0" "退出" "" "$C_DIM"
+      echo "" >&2
+
+      local action=""
+      if ! action="$(ask "请选择 (0-4)" "1")"; then
+        break
+      fi
+      case "$action" in
+        1)
+          if ! check_deps "true"; then
+            continue
+          fi
+          BASE_CONFIG_JSON=""
+          INBOUNDS_JSON="$(build_inbounds_interactive)"
+          configure_full_outbounds_interactive
+          config_file="$(ask "输出文件路径" "$config_file")"
+          if save_config "$config_file" "true"; then
+            fresh_mode="false"
+            prompt_restart_xray_after_save
+          fi
+          ;;
+        2)
+          monitor_xray_interactive "$config_file"
+          ;;
+        3)
+          manage_xray_install_interactive || true
+          ;;
+        4)
+          local target_url="${update_url:-${XRAY_GEN_UPDATE_URL:-$DEFAULT_UPDATE_URL}}"
+          target_url="$(ask "更新脚本 URL (回车使用默认地址)" "$target_url")"
+          if self_update "$target_url" && [[ "$SELF_UPDATED" == "true" ]]; then
+            echo "请重新运行脚本以使用新版本。"
+            exit 0
+          fi
+          ;;
+        0)
+          echo "已退出。"
+          exit 0
+          ;;
+        *)
+          echo "无效选项。" >&2
+          ;;
+      esac
+    fi
+  done
 }
 
 main "$@"
