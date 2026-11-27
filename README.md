@@ -4,7 +4,7 @@ Xray-core 安装、配置管理与状态监测脚本（基于 Bash + jq）。
 
 ## 安装并使用
 
-默认安装到 `/usr/local/bin/xray_gen`，之后在任意目录直接运行 `xray_gen` 即可。
+默认安装到 `/usr/local/bin/xray_gen`，之后在任意目录直接运行 `xg` 即可。
 
 使用 `curl` 安装并运行（非 root 用户请在 `curl` 和 `chmod` 前分别加 `sudo`）：
 
